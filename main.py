@@ -313,61 +313,103 @@ async def proxy_chat_completions(
         if config.model:
             proxy_body["model"] = config.model
 
+        response_context = None  # 用于流式传输的上下文
         try:
             if is_stream:
                 # --- 处理流式请求 ---
-                async def stream_generator():
-                    nonlocal last_error, last_error_response
+
+                # 1. 准备流上下文
+                response_context = httpx_client.stream(
+                    "POST",
+                    proxy_url,
+                    headers=proxy_headers,
+                    json=proxy_body
+                )
+
+                # 2. 异步进入上下文 (建立连接并获取头)
+                response = await response_context.__aenter__()
+
+                # 3. 检查 HTTP 状态码
+                if response.status_code >= 400:
+                    # 这是一个 HTTP 错误 (例如 401)
+                    # 读取错误体
+                    response_body = await response.aread()
+                    error_text = response_body.decode('utf-8')
+                    log_message(f"配置项 ID: {config.id} 失败 (HTTP {response.status_code}): {error_text}")
+
+                    # 记录最后错误
+                    last_error = f"HTTP {response.status_code}: {error_text}"
                     try:
-                        async with httpx_client.stream(
-                                "POST",
-                                proxy_url,
-                                headers=proxy_headers,
-                                json=proxy_body
-                        ) as response:
-                            # 立即检查状态码，如果失败则触发外部的 except
-                            if response.status_code >= 400:
-                                response_body = await response.aread()
-                                response.raise_for_status()  # 这将引发 HTTPStatusError
+                        error_content = json.loads(error_text)
+                    except Exception:
+                        error_content = error_text
 
-                            # 成功，开始流式传输
-                            async for chunk in response.aiter_bytes():
-                                yield chunk
+                    # 定义一个简单的类来模拟 httpx.Response 的部分接口
+                    class MockResponse:
+                        def __init__(self, content, status_code_val):
+                            self._content = content
+                            self.status_code = status_code_val
 
-                        # 流式传输成功
-                        log_message(f"配置项 ID: {config.id} 流式请求成功")
-                        await update_stats(config.id, is_success=True)
+                        def json(self):
+                            if isinstance(self._content, dict):
+                                return self._content
+                            try:
+                                return json.loads(self.text)
+                            except Exception:
+                                return {"error": self.text}
 
-                    except httpx.HTTPStatusError as e:
-                        # 捕获 HTTP 错误 (4xx, 5xx)
-                        last_error = e
-                        last_error_response = e.response
-                        log_message(f"配置项 ID: {config.id} 失败 (HTTP {e.response.status_code}): {e.response.text}")
-                        # 抛出异常以便外层知道流已失败
-                        raise
-                    except httpx.RequestError as e:
-                        # 捕获连接错误, 超时等
-                        last_error = e
-                        log_message(f"配置项 ID: {config.id} 失败 (RequestError): {e}")
-                        raise
-                    except Exception as e:
-                        last_error = e
-                        log_message(f"配置项 ID: {config.id} 失败 (Exception): {e}")
-                        raise
+                        @property
+                        def text(self):
+                            if isinstance(self._content, str):
+                                return self._content
+                            return str(self._content)
 
-                # 必须在 try/except 外部返回 StreamingResponse
-                # 因为 stream_generator() 是一个生成器，它在被迭代时才会执行
-                try:
-                    # 返回流式响应
-                    return StreamingResponse(stream_generator(), media_type="text/event-stream")
-                except Exception:
-                    # 如果 stream_generator 内部抛出异常 (在迭代开始时或期间)
-                    # 我们在这里捕获它，并记录失败，然后 continue 到下一个配置
+                    last_error_response = MockResponse(error_content, response.status_code)
+
                     await update_stats(config.id, is_success=False)
-                    continue  # 尝试下一个配置
+
+                    # 在 continue 之前必须关闭 response
+                    await response_context.__aexit__(None, None, None)
+                    response_context = None  # 标记为已关闭
+
+                    continue  # <--- 关键：失败了，尝试下一个 config
+
+                # 4. 如果状态码是成功的 (2xx)
+
+                async def final_stream_generator(config_id_success, ctx, resp):
+                    """
+                    这个生成器负责迭代数据块，并在最后 (或异常时)
+                    正确地关闭 httpx 上下文。
+                    """
+                    try:
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+                        # 只有在循环正常结束后 (没抛异常) 才算成功
+                        log_message(f"配置项 ID: {config_id_success} 流式请求成功 (流结束)")
+                        await update_stats(config_id_success, is_success=True)
+                    except Exception as e:
+                        # 捕获流传输过程中的错误
+                        log_message(f"配置项 ID: {config_id_success} 在流传输过程中失败: {e}")
+                        # 注意：我们在这里不调用 update_stats(False)
+                        # 因为请求 *启动* 是成功的，我们不能重试
+                        # 也不调用 update_stats(True)
+                        raise  # 重新抛出异常，让 FastAPI 知道连接已断开
+                    finally:
+                        # 无论如何都要关闭上下文
+                        await ctx.__aexit__(None, None, None)
+
+                log_message(f"配置项 ID: {config.id} 流式请求启动成功 (HTTP {response.status_code})")
+
+                # 标记 response_context 将由生成器管理，防止外层 try/except/finally 再次关闭它
+                response_context = None
+
+                return StreamingResponse(
+                    final_stream_generator(config.id, response_context, response),
+                    media_type="text/event-stream"
+                )
 
             else:
-                # --- 处理非流式请求 ---
+                # --- 处理非流式请求 --- (保持不变)
                 response = await httpx_client.post(
                     proxy_url,
                     headers=proxy_headers,
@@ -383,23 +425,27 @@ async def proxy_chat_completions(
                 return JSONResponse(content=response.json(), status_code=response.status_code)
 
         except httpx.HTTPStatusError as e:
-            # 4xx, 5xx 错误
+            # (这个只会在非流式请求中被捕获)
             last_error = e
             last_error_response = e.response
             log_message(f"配置项 ID: {config.id} 失败 (HTTP {e.response.status_code}): {e.response.text}")
             await update_stats(config.id, is_success=False)
         except httpx.RequestError as e:
-            # 连接错误, 超时等
+            # (这个会在流式 (连接失败) 和非流式 (连接失败) 中被捕获)
             last_error = e
             log_message(f"配置项 ID: {config.id} 失败 (RequestError): {e}")
             await update_stats(config.id, is_success=False)
         except Exception as e:
-            # 其他未知错误
+            # (其他未知错误)
             last_error = e
             log_message(f"配置项 ID: {config.id} 失败 (Exception): {e}")
             await update_stats(config.id, is_success=False)
 
-        # 如果代码执行到这里，说明当前配置失败了，循环将继续尝试下一个
+        finally:
+            # 如果 response_context 仍存在 (意味着 __aenter__ 失败或未被正确处理)
+            # 确保它被关闭。
+            if response_context is not None:
+                await response_context.__aexit__(None, None, None)
 
     # --- 所有配置都已尝试 ---
     log_message("所有配置项均尝试失败")
@@ -419,7 +465,6 @@ async def proxy_chat_completions(
         status_code=500,
         content={"error": f"所有后端均失败。最后错误: {str(last_error)}"}
     )
-
 
 # --- 6. 管理 API (带认证) ---
 
