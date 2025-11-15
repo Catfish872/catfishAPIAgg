@@ -240,6 +240,38 @@ async def v1_root_check():
     """
     return {"status": "ok", "message": f"{PROJECT_NAME} API {API_VERSION} is running."}
 
+
+@app.get("/v1/models", tags=["Proxy"])
+async def get_models(auth: bool = Depends(verify_key)):
+    """
+    提供一个模型列表端点，返回配置中所有不重复的模型名称。
+    """
+    configs = await get_configs()
+
+    # 收集所有配置中明确指定的、不重复的模型名称
+    model_ids = set()
+    for config in configs:
+        if config.model:
+            model_ids.add(config.model)
+
+    # 格式化为 OpenAI API 兼容的格式
+    model_data = []
+    sorted_model_ids = sorted(list(model_ids))  # 排序以保证每次返回顺序一致
+
+    for model_id in sorted_model_ids:
+        model_data.append({
+            "id": model_id,
+            "object": "model",
+            "created": 1,  # 使用一个静态时间戳
+            "owned_by": "catfishapiagg",
+        })
+
+    return {
+        "object": "list",
+        "data": model_data,
+    }
+
+
 @app.post("/v1/chat/completions", tags=["Proxy"])
 async def proxy_chat_completions(
         request: Request,
@@ -453,14 +485,14 @@ async def delete_config(config_id: str):
 @admin_router.get("/stats")
 async def get_statistics():
     """获取请求统计数据 (包含日期重置逻辑)"""
-    #log_message("管理: 请求统计数据")
+    # log_message("管理: 请求统计数据")
     return await get_stats()
 
 
 @admin_router.get("/logs")
 async def get_logs() -> List[str]:
     """获取最新的 200 条内存日志"""
-    #log_message("管理: 请求内存日志")
+    # log_message("管理: 请求内存日志")
     return list(log_deque)
 
 
