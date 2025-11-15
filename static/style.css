@@ -1,0 +1,372 @@
+/* --- 1. 全局和重置 --- */
+:root {
+    --color-primary: #4f46e5; /* Indigo 600 */
+    --color-primary-dark: #4338ca; /* Indigo 700 */
+    --color-primary-light: #e0e7ff; /* Indigo 100 */
+    --color-secondary: #6b7280; /* Gray 500 */
+    --color-secondary-light: #f3f4f6; /* Gray 100 */
+    --color-danger: #dc2626; /* Red 600 */
+    --color-danger-dark: #b91c1c; /* Red 700 */
+    --color-success: #16a34a; /* Green 600 */
+    --color-text: #1f2937; /* Gray 800 */
+    --color-text-light: #6b7280; /* Gray 500 */
+    --color-bg: #f3f4f6; /* Gray 100 - 背景色 */
+    --color-white: #ffffff;
+    --color-border: #e5e7eb; /* Gray 200 */
+    --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+    --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+    --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+    --radius-md: 0.375rem; /* 6px */
+    --radius-lg: 0.5rem; /* 8px */
+    --radius-xl: 0.75rem; /* 12px */
+}
+
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background-color: var(--color-bg);
+    color: var(--color-text);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-weight: 700;
+    margin-bottom: 0.75rem;
+}
+
+h1 { font-size: 1.875rem; }
+h2 { font-size: 1.5rem; margin-top: 0; }
+h3 { font-size: 1.25rem; margin-top: 1rem; }
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+th, td {
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--color-border);
+    text-align: left;
+    vertical-align: middle;
+    /* 单词过长时换行 */
+    word-break: break-all;
+}
+
+thead th {
+    background-color: var(--color-secondary-light);
+    color: var(--color-text-light);
+    font-weight: 500;
+    font-size: 0.875rem;
+    text-transform: uppercase;
+}
+
+tbody tr:hover {
+    background-color: #fafafa;
+}
+
+td small {
+    color: var(--color-text-light);
+    font-family: monospace;
+}
+
+/* --- 2. 辅助类 --- */
+.hidden { display: none !important; }
+.mt-2 { margin-top: 2rem; }
+.full-width { width: 100%; }
+.error-text {
+    color: var(--color-danger);
+    font-size: 0.875rem;
+    min-height: 1.25rem;
+}
+.success-text { color: var(--color-success) !important; font-weight: 500; }
+.fail-text { color: var(--color-danger) !important; font-weight: 500; }
+
+/* --- 3. 布局 (卡片式) --- */
+
+/* 顶部导航栏 */
+#top-bar {
+    background-color: var(--color-white);
+    box-shadow: var(--shadow-sm);
+    padding: 1rem 1.5rem;
+    position: sticky;
+    top: 0;
+    z-index: 50;
+}
+.header-content {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+#top-bar h1 {
+    font-size: 1.25rem;
+    margin: 0;
+}
+
+/* 主容器 */
+#app-container {
+    max-width: 1200px;
+    margin: 1.5rem auto;
+    padding: 0 1.5rem;
+}
+
+/* 核心：卡片 */
+.card {
+    background: var(--color-white);
+    border-radius: var(--radius-xl); /* 更大的圆角 */
+    box-shadow: var(--shadow-md);
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+}
+/* 登录框也是卡片 */
+.login-box.card {
+    padding: 2rem;
+    border-radius: var(--radius-xl);
+}
+
+/* 表格容器 */
+.table-container {
+    overflow-x: auto;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg); /* 内嵌圆角 */
+}
+
+/* 内嵌表单卡片 */
+.form-card {
+    margin-top: 2rem;
+    background-color: #fafafa;
+    border: 1px solid var(--color-border);
+    box-shadow: var(--shadow-sm);
+}
+
+/* --- 4. 登录遮罩 --- */
+#login-overlay {
+    position: fixed;
+    inset: 0;
+    background-color: var(--color-bg); /* 不用半透明，直接用背景色 */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+}
+
+.login-box {
+    width: 100%;
+    max-width: 400px;
+    text-align: center;
+}
+.login-box h2 {
+    margin-top: 0;
+    font-size: 1.75rem;
+}
+
+/* --- 5. 表单和按钮 --- */
+.input-group {
+    margin-bottom: 1rem;
+    text-align: left;
+}
+.input-group label {
+    display: block;
+    font-weight: 500;
+    margin-bottom: 0.5rem;
+    font-size: 0.875rem;
+}
+input[type="text"],
+input[type="password"],
+input[type="number"] {
+    width: 100%;
+    padding: 0.75rem;
+    font-size: 1rem;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+input[type="text"]:focus,
+input[type="password"]:focus,
+input[type="number"]:focus {
+    outline: none;
+    border-color: var(--color-primary);
+    box-shadow: 0 0 0 3px var(--color-primary-light);
+}
+
+.button, button {
+    display: inline-block;
+    padding: 0.75rem 1.25rem;
+    font-size: 1rem;
+    font-weight: 500;
+    border: none;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: all 0.2s;
+    text-align: center;
+}
+.button:hover, button:hover {
+    transform: translateY(-1px); /* 轻微上浮 */
+    box-shadow: var(--shadow-sm);
+}
+
+.button-primary {
+    background-color: var(--color-primary);
+    color: var(--color-white);
+}
+.button-primary:hover {
+    background-color: var(--color-primary-dark);
+}
+
+.button-secondary {
+    background-color: var(--color-secondary-light);
+    color: var(--color-text);
+    border: 1px solid var(--color-border);
+}
+.button-secondary:hover {
+    background-color: var(--color-border);
+}
+
+.danger, .button.danger {
+    background-color: var(--color-danger);
+    color: var(--color-white);
+}
+.danger:hover, .button.danger:hover {
+    background-color: var(--color-danger-dark);
+}
+
+.form-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1rem;
+}
+@media (min-width: 600px) {
+    .form-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+    .full-span {
+        grid-column: 1 / -1;
+    }
+}
+.form-actions {
+    margin-top: 1.5rem;
+    display: flex;
+    gap: 0.5rem;
+}
+
+/* --- 6. 选项卡 (新样式) --- */
+.tabs {
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.5rem; /* 让卡片有内边距 */
+}
+.tab-button {
+    flex: 1; /* 均分 */
+    padding: 0.75rem;
+    font-size: 1rem;
+    font-weight: 500;
+    background-color: transparent;
+    border: none;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    color: var(--color-text-light);
+    transition: all 0.2s;
+}
+.tab-button:hover {
+    background-color: var(--color-secondary-light);
+    color: var(--color-text);
+    transform: none;
+    box-shadow: none;
+}
+.tab-button.active {
+    background-color: var(--color-primary);
+    color: var(--color-white);
+    box-shadow: var(--shadow-sm);
+}
+.tab-content {
+    display: none;
+}
+.tab-content.active {
+    display: block;
+}
+
+/* --- 7. 统计卡片 --- */
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem;
+}
+.stat-card {
+    /* 现在 .stat-card 也被赋予了 .card 类 */
+    padding: 1.5rem;
+    text-align: center;
+    border: 1px solid var(--color-border);
+}
+.stat-card h4 {
+    margin: 0;
+    font-weight: 500;
+    color: var(--color-text-light);
+    font-size: 1rem;
+}
+.stat-card p {
+    font-size: 2.25rem;
+    font-weight: 700;
+    margin: 0.5rem 0 0;
+}
+
+/* --- 8. 日志 --- */
+.logs-container {
+    background-color: #1f2937; /* Gray 800 */
+    color: #f3f4f6; /* Gray 100 */
+    border-radius: var(--radius-lg);
+    padding: 1.5rem;
+    height: 400px;
+    overflow-y: auto;
+    font-family: Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+#logs-content {
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-size: 0.875rem;
+}
+
+/* --- 9. 表格操作按钮 --- */
+td .edit-btn,
+td .delete-btn {
+    padding: 0.25rem 0.5rem;
+    font-size: 0.875rem;
+    margin-right: 0.25rem;
+}
+td .edit-btn {
+    background-color: var(--color-secondary-light);
+    border: 1px solid var(--color-border);
+    color: var(--color-text);
+}
+td .edit-btn:hover {
+    background-color: var(--color-border);
+}
+
+/* 移动端适配 */
+@media (max-width: 600px) {
+    #app-container {
+        margin: 0.5rem auto;
+        padding: 0 0.5rem;
+    }
+    .card {
+        padding: 1rem;
+        margin-bottom: 1rem;
+        border-radius: var(--radius-lg);
+    }
+    .tabs {
+        flex-direction: column;
+    }
+    #top-bar {
+        padding: 1rem;
+    }
+    #top-bar h1 {
+        font-size: 1.1rem;
+    }
+}

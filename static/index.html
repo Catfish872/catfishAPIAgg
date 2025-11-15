@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>catfishAPIAgg - 管理面板</title>
+    <!-- 引入 Google Font 'Inter' -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+    <!-- 引入样式表 -->
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+    <!-- 
+      登录遮罩
+    -->
+    <div id="login-overlay">
+        <div class="login-box card">
+            <h2>catfishAPIAgg</h2>
+            <p>管理员登录</p>
+            <div class="input-group">
+                <input type="password" id="admin-key-input" placeholder="请输入管理员密钥">
+            </div>
+            <p id="login-error" class="error-text"></p>
+            <button id="login-button" class="button button-primary full-width">登录</button>
+        </div>
+    </div>
+
+    <!-- 
+      顶部导航栏 (新)
+    -->
+    <header id="top-bar" class="hidden">
+        <div class="header-content">
+            <h1>catfishAPIAgg - 面板</h1>
+            <button id="logout-button" class="button button-secondary">退出登录</button>
+        </div>
+    </header>
+
+    <!-- 
+      主应用容器 (更新)
+      (不再是卡片, 只是一个布局容器)
+    -->
+    <div id="app-container" class="hidden">
+        
+        <main>
+            <!-- 选项卡导航 (更新) -->
+            <nav class="tabs card">
+                <button class="tab-button active" data-tab="config">API 配置</button>
+                <button class="tab-button" data-tab="stats">请求统计</button>
+                <button class="tab-button" data-tab="logs">实时日志</button>
+            </nav>
+
+            <!-- 
+              选项卡内容
+              (每个 tab-content 现在都是一个卡片)
+            -->
+
+            <!-- 1. API 配置 -->
+            <section id="config-tab" class="tab-content card active">
+                <h2>API 配置项</h2>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>优先级</th>
+                                <th>URL</th>
+                                <th>Key (遮罩)</th>
+                                <th>覆盖 Model</th>
+                                <th>ID</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="config-table-body">
+                            <!-- JS 动态填充 -->
+                            <tr><td colspan="6">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- (表单现在是内嵌卡片) -->
+                <div class="card form-card">
+                    <h3 id="form-title">添加新配置</h3>
+                    <form id="config-form">
+                        <!-- 隐藏的 ID 字段，用于编辑 -->
+                        <input type="hidden" id="config-id">
+                        
+                        <div class="form-grid">
+                            <div class="input-group">
+                                <label for="config-priority">优先级 (数字越小越优先)</label>
+                                <input type="number" id="config-priority" placeholder="例如: 1" required>
+                            </div>
+                            <div class="input-group">
+                                <label for="config-url">API 终端 URL</label>
+                                <input type="text" id="config-url" placeholder="https://api.openai.com/v1" required>
+                            </div>
+                            <div class="input-group full-span">
+                                <label for="config-key">API Key</label>
+                                <input type="password" id="config-key" placeholder="sk-..." required>
+                            </div>
+                            <div class="input-group full-span">
+                                <label for="config-model">覆盖 Model (选填)</label>
+                                <input type="text" id="config-model" placeholder="留空则使用原始请求的 model">
+                            </div>
+                        </div>
+                        <div class="form-actions">
+                            <button type="submit" id="save-button" class="button button-primary">保存</button>
+                            <button type="button" id="cancel-button" class="button button-secondary hidden">取消</button>
+                        </div>
+                    </form>
+                </div>
+            </section>
+
+            <!-- 2. 请求统计 -->
+            <section id="stats-tab" class="tab-content card">
+                <h2>统计概览</h2>
+                <div class="stats-grid">
+                    <div class="stat-card card">
+                        <h4>总计成功</h4>
+                        <p id="stat-total-success" class="success-text">0</p>
+                    </div>
+                    <div class="stat-card card">
+                        <h4>总计失败</h4>
+                        <p id="stat-total-fail" class="fail-text">0</p>
+                    </div>
+                    <div class="stat-card card">
+                        <h4>今日成功</h4>
+                        <p id="stat-today-success" class="success-text">0</p>
+                    </div>
+                    <div class="stat-card card">
+                        <h4>今日失败</h4>
+                        <p id="stat-today-fail" class="fail-text">0</p>
+                    </div>
+                </div>
+
+                <h3 class="mt-2">按配置统计</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>URL</th>
+                                <th class="success-text">成功</th>
+                                <th class="fail-text">失败</th>
+                            </tr>
+                        </thead>
+                        <tbody id="stats-by-config-body">
+                            <!-- JS 动态填充 -->
+                            <tr><td colspan="4">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- 3. 实时日志 -->
+            <section id="logs-tab" class="tab-content card">
+                <h2>实时日志 (最新 200 条)</h2>
+                <div class="logs-container">
+                    <pre id="logs-content">加载中...</pre>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- 引入 JS (defer 确保 DOM 加载完毕) -->
+    <script src="/static/app.js" defer></script>
+</body>
+</html>
