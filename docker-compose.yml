@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  catfishapiagg:
+    image: ghcr.io/catfish872/catfishapiagg:latest
+    
+    container_name: catfishapiagg_service
+    
+    ports:
+      - "${PORT}:${PORT}"
+    
+    volumes:
+      # 持久化 config.json 和 stats.json
+      - catfish_data:/app/data
+    
+    environment:
+      - ADMIN_KEY=${ADMIN_KEY}
+      - PORT=${PORT} 
+    
+    restart: unless-stopped
+
+volumes:
+  catfish_data:
