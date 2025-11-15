@@ -389,11 +389,20 @@ async def proxy_chat_completions(
                         await update_stats(config_id_success, is_success=True)
                     except Exception as e:
                         # 捕获流传输过程中的错误
-                        log_message(f"配置项 ID: {config_id_success} 在流传输过程中失败: {e}")
-                        # 注意：我们在这里不调用 update_stats(False)
-                        # 因为请求 *启动* 是成功的，我们不能重试
-                        # 也不调用 update_stats(True)
-                        raise  # 重新抛出异常，让 FastAPI 知道连接已断开
+                        # --- [诊断日志] ---
+                        # 改进日志：打印异常类型和 repr()，以便捕获空消息异常
+                        error_type = type(e).__name__
+                        error_repr = repr(e)
+
+                        if error_type == "CancelledError" or "ClientDisconnect" in error_type:
+                            log_message(f"配置项 ID: {config_id_success} 流传输被客户端主动断开 (Type: {error_type})")
+                        else:
+                            log_message(
+                                f"配置项 ID: {config_id_success} 在流传输过程中失败: [Type: {error_type}, Repr: {error_repr}]")
+                        # --- [诊断日志结束] ---
+
+                        # 重新抛出异常，让 FastAPI 知道连接已断开
+                        raise
                     finally:
                         # 无论如何都要关闭上下文
                         await ctx.__aexit__(None, None, None)
@@ -401,10 +410,11 @@ async def proxy_chat_completions(
                 log_message(f"配置项 ID: {config.id} 流式请求启动成功 (HTTP {response.status_code})")
 
                 # 标记 response_context 将由生成器管理，防止外层 try/except/finally 再次关闭它
+                response_context_to_pass = response_context
                 response_context = None
 
                 return StreamingResponse(
-                    final_stream_generator(config.id, response_context, response),
+                    final_stream_generator(config.id, response_context_to_pass, response),
                     media_type="text/event-stream"
                 )
 
