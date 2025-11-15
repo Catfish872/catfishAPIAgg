@@ -23,7 +23,7 @@
 **步骤 1: 克隆项目**
 
 ```bash
-git clone <你的项目仓库地址>
+git clone https://github.com/Catfish872/catfishAPIAgg.git
 cd catfishAPIAgg
 ```
 
@@ -73,7 +73,7 @@ docker-compose logs -f
 **步骤 1: 克隆项目并安装依赖**
 
 ```bash
-git clone <你的项目仓库地址>
+git clone https://github.com/Catfish872/catfishAPIAgg.git
 cd catfishAPIAgg
 pip install -r requirements.txt
 ```
