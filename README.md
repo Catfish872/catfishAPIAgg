@@ -50,7 +50,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
     "model": "gpt-4-pool",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": false
-  }'```
+  }'
+
+```
 在管理后台，将你的 API Keys 组织成不同的方案。
 在调用 API 时，将 model 字段的值设置为你想要使用的方案名。
 如果某个配置项设置了“覆盖 Model”，那么在选中该配置项后，发往上游的请求中 model 字段才会被替换。
