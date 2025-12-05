@@ -3,7 +3,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // --- 1. DOM 元素获取 ---
     const loginOverlay = document.getElementById("login-overlay");
-    const loginBox = document.querySelector(".login-box");
     const loginButton = document.getElementById("login-button");
     const adminKeyInput = document.getElementById("admin-key-input");
     const loginError = document.getElementById("login-error");
@@ -15,67 +14,56 @@ document.addEventListener("DOMContentLoaded", () => {
     const tabs = document.querySelectorAll(".tab-button");
     const tabContents = document.querySelectorAll(".tab-content");
 
-    const configTableBody = document.getElementById("config-table-body");
+    // 配置 Tab
+    const configSchemesContainer = document.getElementById("config-schemes-container");
     const configForm = document.getElementById("config-form");
     const formTitle = document.getElementById("form-title");
     const configIdInput = document.getElementById("config-id");
+    const configSchemeInput = document.getElementById("config-scheme");
     const configPriorityInput = document.getElementById("config-priority");
     const configUrlInput = document.getElementById("config-url");
     const configKeyInput = document.getElementById("config-key");
     const configModelInput = document.getElementById("config-model");
+    const configFailureThresholdInput = document.getElementById("config-failure-threshold");
+    const configDisableDurationInput = document.getElementById("config-disable-duration");
     const saveButton = document.getElementById("save-button");
     const cancelButton = document.getElementById("cancel-button");
 
+    // 统计 Tab
     const statTotalSuccess = document.getElementById("stat-total-success");
     const statTotalFail = document.getElementById("stat-total-fail");
     const statTodaySuccess = document.getElementById("stat-today-success");
     const statTodayFail = document.getElementById("stat-today-fail");
     const statsByConfigBody = document.getElementById("stats-by-config-body");
+    const statsTodayByConfigBody = document.getElementById("stats-today-by-config-body"); // 新增
 
+    // 日志 Tab
     const logsContent = document.getElementById("logs-content");
 
     let adminKey = sessionStorage.getItem("catfishAdminKey");
     let statsInterval, logsInterval;
+    let allSchemesCache = {}; // 缓存配置数据，用于统计显示
 
     // --- 2. 核心功能函数 ---
 
-    /**
-     * 带认证的 fetch 封装
-     * @param {string} url - 请求 URL
-     * @param {object} options - fetch 选项
-     * @returns {Promise<Response>}
-     */
     async function authedFetch(url, options = {}) {
         if (!adminKey) {
             console.error("No admin key found");
             showLogin("会话已过期，请重新登录");
             return;
         }
-
-        const headers = {
-            ...options.headers,
-            'Authorization': `Bearer ${adminKey}`
-        };
-
+        const headers = { ...options.headers, 'Authorization': `Bearer ${adminKey}` };
         if (options.body && !(options.body instanceof FormData)) {
             headers['Content-Type'] = 'application/json';
         }
-
         const response = await fetch(url, { ...options, headers });
-
         if (response.status === 401) {
-            // 认证失败，清除 key 并显示登录
             showLogin("认证失败，请重新登录");
             return;
         }
-
         return response;
     }
 
-    /**
-     * 显示登录界面
-     * @param {string} errorMsg - 可选的错误消息
-     */
     function showLogin(errorMsg = "") {
         adminKey = null;
         sessionStorage.removeItem("catfishAdminKey");
@@ -83,48 +71,31 @@ document.addEventListener("DOMContentLoaded", () => {
         topBar.classList.add("hidden");
         appContainer.classList.add("hidden");
         loginError.textContent = errorMsg;
-        // 停止定时刷新
         if (statsInterval) clearInterval(statsInterval);
         if (logsInterval) clearInterval(logsInterval);
     }
 
-    /**
-     * 显示主应用界面
-     */
     function showApp() {
         loginOverlay.classList.add("hidden");
         topBar.classList.remove("hidden");
         appContainer.classList.remove("hidden");
         loginError.textContent = "";
-
-        // 首次加载数据
         loadAllData();
-
-        // 设置定时刷新
-        statsInterval = setInterval(loadStats, 5000); // 5秒刷新一次统计
-        logsInterval = setInterval(loadLogs, 5000); // 5秒刷新一次日志
+        statsInterval = setInterval(loadStats, 5000);
+        logsInterval = setInterval(loadLogs, 5000);
     }
 
-    /**
-     * 处理登录
-     */
     async function handleLogin() {
         const key = adminKeyInput.value;
         if (!key) {
             loginError.textContent = "请输入密钥";
             return;
         }
-        
-        // 尝试用这个 key 请求一个受保护的端点 (例如 /admin/logs)
         try {
-            const response = await fetch("/admin/logs", {
-                headers: { 'Authorization': `Bearer ${key}` }
-            });
-
+            const response = await fetch("/admin/logs", { headers: { 'Authorization': `Bearer ${key}` } });
             if (response.status === 401) {
                 loginError.textContent = "密钥不正确";
             } else if (response.ok) {
-                // 登录成功
                 adminKey = key;
                 sessionStorage.setItem("catfishAdminKey", key);
                 showApp();
@@ -136,141 +107,192 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    /**
-     * 加载所有数据
-     */
     function loadAllData() {
         loadConfigs();
         loadStats();
         loadLogs();
     }
 
-    /**
-     * 加载 API 配置
-     */
+    // [重构] 加载并渲染所有方案配置
     async function loadConfigs() {
         try {
             const response = await authedFetch("/admin/config");
             if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-            const configs = await response.json();
+            const schemes = await response.json();
+            allSchemesCache = schemes; // 缓存数据
 
-            configTableBody.innerHTML = ""; // 清空
-            if (configs.length === 0) {
-                configTableBody.innerHTML = `<tr><td colspan="6">尚未添加任何配置项</td></tr>`;
+            configSchemesContainer.innerHTML = ""; // 清空
+            const schemeNames = Object.keys(schemes);
+
+            if (schemeNames.length === 0) {
+                configSchemesContainer.innerHTML = `<p>尚未添加任何配置项。</p>`;
                 return;
             }
 
-            configs.forEach(config => {
-                const tr = document.createElement("tr");
-                tr.innerHTML = `
-                    <td>${config.priority}</td>
-                    <td><small>${config.url}</small></td>
-                    <td><small>sk-*****${config.api_key.slice(-4)}</small></td>
-                    <td>${config.model || '<em>(使用原始)</em>'}</td>
-                    <td><small>${config.id}</small></td>
-                    <td>
-                        <button class="button edit-btn" data-id="${config.id}">编辑</button>
-                        <button class="button danger delete-btn" data-id="${config.id}">删除</button>
-                    </td>
+            schemeNames.sort().forEach(schemeName => {
+                const configs = schemes[schemeName];
+                const schemeBlock = document.createElement("div");
+                schemeBlock.className = "scheme-block";
+                
+                let tableRows = '';
+                if (configs.length > 0) {
+                    configs.forEach(config => {
+                        tableRows += `
+                            <tr data-config-id="${config.id}" data-scheme-name="${schemeName}">
+                                <td>${config.priority}</td>
+                                <td><small>${config.url}</small></td>
+                                <td><small>sk-*****${config.api_key.slice(-4)}</small></td>
+                                <td>${config.model || '<em>(使用原始)</em>'}</td>
+                                <td>
+                                    ${config.consecutive_failure_threshold ? `<strong>${config.consecutive_failure_threshold}次</strong> / ${config.disable_duration_seconds}s` : '<em>(未设置)</em>'}
+                                </td>
+                                <td><small>${config.id}</small></td>
+                                <td>
+                                    <button class="button edit-btn">编辑</button>
+                                    <button class="button danger delete-btn">删除</button>
+                                </td>
+                            </tr>
+                        `;
+                    });
+                } else {
+                    tableRows = `<tr><td colspan="7">该方案下没有配置项</td></tr>`;
+                }
+
+                schemeBlock.innerHTML = `
+                    <div class="scheme-header">
+                        <h3>${schemeName} <small>(Model Name)</small></h3>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>优先级</th>
+                                    <th>URL</th>
+                                    <th>Key (遮罩)</th>
+                                    <th>覆盖 Model</th>
+                                    <th>熔断设置 (失败/时长)</th>
+                                    <th>ID</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>${tableRows}</tbody>
+                        </table>
+                    </div>
                 `;
-                // 添加事件监听
-                tr.querySelector(".edit-btn").addEventListener("click", () => populateFormForEdit(config));
-                tr.querySelector(".delete-btn").addEventListener("click", () => handleDeleteConfig(config.id));
-                configTableBody.appendChild(tr);
+                configSchemesContainer.appendChild(schemeBlock);
             });
+            
+            // 为所有新生成的按钮添加事件监听
+            configSchemesContainer.querySelectorAll('.edit-btn').forEach(btn => {
+                const row = btn.closest('tr');
+                btn.addEventListener('click', () => {
+                    const configId = row.dataset.configId;
+                    const schemeName = row.dataset.schemeName;
+                    populateFormForEdit(allSchemesCache[schemeName].find(c => c.id === configId), schemeName);
+                });
+            });
+            configSchemesContainer.querySelectorAll('.delete-btn').forEach(btn => {
+                const row = btn.closest('tr');
+                btn.addEventListener('click', () => handleDeleteConfig(row.dataset.configId));
+            });
+
 
         } catch (err) {
             console.error("加载配置失败:", err);
-            configTableBody.innerHTML = `<tr><td colspan="6" class="fail-text">加载配置失败</td></tr>`;
+            configSchemesContainer.innerHTML = `<p class="fail-text">加载配置失败: ${err.message}</p>`;
         }
     }
 
-    /**
-     * 加载统计数据
-     */
+    // [重构] 加载统计数据
     async function loadStats() {
         try {
             const response = await authedFetch("/admin/stats");
-            if (!response || !response.ok) return; // authedFetch 会处理 401
+            if (!response || !response.ok) return;
             const stats = await response.json();
-            const allConfigs = (await (await authedFetch("/admin/config")).json()) || [];
 
             statTotalSuccess.textContent = stats.total.success || 0;
             statTotalFail.textContent = stats.total.fail || 0;
             statTodaySuccess.textContent = stats.today.success || 0;
             statTodayFail.textContent = stats.today.fail || 0;
 
-            // 按配置统计
-            statsByConfigBody.innerHTML = ""; // 清空
-            if (allConfigs.length === 0) {
-                statsByConfigBody.innerHTML = `<tr><td colspan="4">没有配置项</td></tr>`;
-                return;
-            }
+            const allConfigsFlat = Object.values(allSchemesCache).flat();
 
-            allConfigs.forEach(config => {
-                const configStat = stats.by_config_id[config.id] || { success: 0, fail: 0 };
-                const tr = document.createElement("tr");
-                tr.innerHTML = `
-                    <td><small>${config.id}</small></td>
-                    <td><small>${config.url}</small></td>
-                    <td class="success-text">${configStat.success}</td>
-                    <td class="fail-text">${configStat.fail}</td>
-                `;
-                statsByConfigBody.appendChild(tr);
-            });
+            // 渲染历史总计
+            renderStatsTable(statsByConfigBody, allConfigsFlat, stats.by_config_id, true);
+            // 渲染今日统计
+            renderStatsTable(statsTodayByConfigBody, allConfigsFlat, stats.today.by_config_id, false);
 
         } catch (err) {
             console.error("加载统计失败:", err);
-            // 不在循环中提示错误，避免打扰
         }
     }
+    
+    // [新增] 渲染统计表格的辅助函数
+    function renderStatsTable(tbody, configs, statsData, isTotal) {
+        tbody.innerHTML = "";
+        if (configs.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="${isTotal ? 6 : 4}">没有配置项</td></tr>`;
+            return;
+        }
 
-    /**
-     * 加载日志
-     */
+        configs.forEach(config => {
+            const configStat = statsData[config.id] || { success: 0, fail: 0 };
+            const tr = document.createElement("tr");
+            let rowHTML = `
+                <td><small>${config.id}</small></td>
+                <td><small>${config.url}</small></td>
+                <td class="success-text">${configStat.success || 0}</td>
+                <td class="fail-text">${configStat.fail || 0}</td>
+            `;
+            if (isTotal) {
+                const disabledUntil = configStat.disabled_until ? new Date(configStat.disabled_until).toLocaleString() : '<em>-</em>';
+                rowHTML += `
+                    <td>${configStat.consecutive_fails || 0}</td>
+                    <td><small>${disabledUntil}</small></td>
+                `;
+            }
+            tr.innerHTML = rowHTML;
+            tbody.appendChild(tr);
+        });
+    }
+
+
     async function loadLogs() {
         try {
             const response = await authedFetch("/admin/logs");
             if (!response || !response.ok) return;
             const logs = await response.json();
-            
-            // 倒序显示，最新的在最上面
             logsContent.textContent = logs.reverse().join("\n");
         } catch (err) {
             console.error("加载日志失败:", err);
         }
     }
 
-    /**
-     * 重置表单
-     */
     function resetForm() {
         configForm.reset();
         configIdInput.value = "";
         formTitle.textContent = "添加新配置";
+        configSchemeInput.disabled = false;
         cancelButton.classList.add("hidden");
     }
 
-    /**
-     * 填充表单以便编辑
-     * @param {object} config - 配置对象
-     */
-    function populateFormForEdit(config) {
+    // [重构] 填充表单
+    function populateFormForEdit(config, schemeName) {
         formTitle.textContent = "编辑配置项";
         configIdInput.value = config.id;
+        configSchemeInput.value = schemeName;
+        configSchemeInput.disabled = true; // 编辑时不允许修改方案
         configPriorityInput.value = config.priority;
         configUrlInput.value = config.url;
-        configKeyInput.value = config.api_key; // 注意：这会显示 Key
+        configKeyInput.value = config.api_key;
         configModelInput.value = config.model;
+        configFailureThresholdInput.value = config.consecutive_failure_threshold;
+        configDisableDurationInput.value = config.disable_duration_seconds;
         cancelButton.classList.remove("hidden");
-        // 滚动到表单
         configForm.scrollIntoView({ behavior: "smooth" });
     }
 
-    /**
-     * 处理表单提交 (创建或更新)
-     * @param {Event} e - 事件对象
-     */
+    // [重构] 处理表单提交
     async function handleFormSubmit(e) {
         e.preventDefault();
         
@@ -281,22 +303,27 @@ document.addEventListener("DOMContentLoaded", () => {
             priority: parseInt(configPriorityInput.value, 10),
             url: configUrlInput.value,
             api_key: configKeyInput.value,
-            model: configModelInput.value || null // 如果为空字符串，发送 null
+            model: configModelInput.value || null,
+            consecutive_failure_threshold: configFailureThresholdInput.value ? parseInt(configFailureThresholdInput.value, 10) : null,
+            disable_duration_seconds: configDisableDurationInput.value ? parseInt(configDisableDurationInput.value, 10) : null,
         };
-
-        const url = isEditing ? `/admin/config/${configId}` : "/admin/config";
-        const method = isEditing ? "PUT" : "POST";
+        
+        let url, method;
+        if (isEditing) {
+            url = `/admin/config/${configId}`;
+            method = "PUT";
+        } else {
+            url = "/admin/config";
+            method = "POST";
+            data.scheme_name = configSchemeInput.value; // 仅在创建时发送 scheme_name
+        }
 
         try {
-            const response = await authedFetch(url, {
-                method: method,
-                body: JSON.stringify(data)
-            });
-
+            const response = await authedFetch(url, { method, body: JSON.stringify(data) });
             if (response.ok) {
                 resetForm();
-                loadConfigs(); // 重新加载配置
-                loadStats(); // 重新加载统计 (可能会有新 ID)
+                await loadConfigs(); // 重新加载配置
+                await loadStats();   // 重新加载统计
             } else {
                 const error = await response.json();
                 alert(`保存失败: ${error.detail || response.statusText}`);
@@ -306,23 +333,13 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    /**
-     * 处理删除配置
-     * @param {string} configId - 要删除的配置 ID
-     */
     async function handleDeleteConfig(configId) {
-        if (!confirm("确定要删除这个配置项吗？")) {
-            return;
-        }
-
+        if (!confirm("确定要删除这个配置项吗？")) return;
         try {
-            const response = await authedFetch(`/admin/config/${configId}`, {
-                method: "DELETE"
-            });
-
+            const response = await authedFetch(`/admin/config/${configId}`, { method: "DELETE" });
             if (response.ok) {
-                loadConfigs(); // 重新加载
-                loadStats(); // 重新加载 (清除已删除的)
+                await loadConfigs();
+                await loadStats();
             } else {
                 const error = await response.json();
                 alert(`删除失败: ${error.detail || response.statusText}`);
@@ -332,39 +349,28 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    // --- 3. 初始化和事件监听 ---
-
     function init() {
-        // 登录/登出
         loginButton.addEventListener("click", handleLogin);
         adminKeyInput.addEventListener("keydown", (e) => {
             if (e.key === "Enter") handleLogin();
         });
         logoutButton.addEventListener("click", () => showLogin("您已退出登录"));
 
-        // 选项卡切换
         tabs.forEach(tab => {
             tab.addEventListener("click", () => {
-                // 移除所有 active
                 tabs.forEach(t => t.classList.remove("active"));
                 tabContents.forEach(c => c.classList.remove("active"));
-                // 添加 active
                 tab.classList.add("active");
                 document.getElementById(tab.dataset.tab + "-tab").classList.add("active");
             });
         });
 
-        // 表单
         configForm.addEventListener("submit", handleFormSubmit);
         cancelButton.addEventListener("click", resetForm);
 
-        // 检查初始登录状态
         if (adminKey) {
-            // 尝试验证 key
             (async () => {
-                const response = await fetch("/admin/logs", { // 用一个轻量级请求验证
-                    headers: { 'Authorization': `Bearer ${adminKey}` }
-                });
+                const response = await fetch("/admin/logs", { headers: { 'Authorization': `Bearer ${adminKey}` } });
                 if (response.ok) {
                     showApp();
                 } else {
@@ -376,6 +382,5 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    // 启动应用
     init();
 });

@@ -74,6 +74,7 @@ tbody tr:hover {
 td small {
     color: var(--color-text-light);
     font-family: monospace;
+    font-size: 0.9em;
 }
 
 /* --- 2. 辅助类 --- */
@@ -126,7 +127,6 @@ td small {
     padding: 1.5rem;
     margin-bottom: 1.5rem;
 }
-/* 登录框也是卡片 */
 .login-box.card {
     padding: 2rem;
     border-radius: var(--radius-xl);
@@ -151,7 +151,7 @@ td small {
 #login-overlay {
     position: fixed;
     inset: 0;
-    background-color: var(--color-bg); /* 不用半透明，直接用背景色 */
+    background-color: var(--color-bg);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -196,6 +196,15 @@ input[type="number"]:focus {
     border-color: var(--color-primary);
     box-shadow: 0 0 0 3px var(--color-primary-light);
 }
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+}
+
 
 .button, button {
     display: inline-block;
@@ -209,7 +218,7 @@ input[type="number"]:focus {
     text-align: center;
 }
 .button:hover, button:hover {
-    transform: translateY(-1px); /* 轻微上浮 */
+    transform: translateY(-1px);
     box-shadow: var(--shadow-sm);
 }
 
@@ -257,14 +266,14 @@ input[type="number"]:focus {
     gap: 0.5rem;
 }
 
-/* --- 6. 选项卡 (新样式) --- */
+/* --- 6. 选项卡 --- */
 .tabs {
     display: flex;
     gap: 0.5rem;
-    padding: 0.5rem; /* 让卡片有内边距 */
+    padding: 0.5rem;
 }
 .tab-button {
-    flex: 1; /* 均分 */
+    flex: 1;
     padding: 0.75rem;
     font-size: 1rem;
     font-weight: 500;
@@ -300,7 +309,6 @@ input[type="number"]:focus {
     gap: 1rem;
 }
 .stat-card {
-    /* 现在 .stat-card 也被赋予了 .card 类 */
     padding: 1.5rem;
     text-align: center;
     border: 1px solid var(--color-border);
@@ -319,8 +327,8 @@ input[type="number"]:focus {
 
 /* --- 8. 日志 --- */
 .logs-container {
-    background-color: #1f2937; /* Gray 800 */
-    color: #f3f4f6; /* Gray 100 */
+    background-color: #1f2937;
+    color: #f3f4f6;
     border-radius: var(--radius-lg);
     padding: 1.5rem;
     height: 400px;
@@ -347,6 +355,28 @@ td .edit-btn {
 }
 td .edit-btn:hover {
     background-color: var(--color-border);
+}
+
+/* --- [新增] 方案配置区块样式 --- */
+.scheme-block {
+    margin-bottom: 2.5rem;
+}
+.scheme-block:last-child {
+    margin-bottom: 0;
+}
+.scheme-header {
+    padding-bottom: 0.5rem;
+    border-bottom: 2px solid var(--color-primary-light);
+    margin-bottom: 1rem;
+}
+.scheme-header h3 {
+    font-size: 1.25rem;
+    margin: 0;
+    color: var(--color-primary);
+}
+.scheme-header h3 small {
+    font-weight: 400;
+    color: var(--color-text-light);
 }
 
 /* 移动端适配 */

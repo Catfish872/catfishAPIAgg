@@ -27,7 +27,7 @@
     </div>
 
     <!-- 
-      顶部导航栏 (新)
+      顶部导航栏
     -->
     <header id="top-bar" class="hidden">
         <div class="header-content">
@@ -37,13 +37,12 @@
     </header>
 
     <!-- 
-      主应用容器 (更新)
-      (不再是卡片, 只是一个布局容器)
+      主应用容器
     -->
     <div id="app-container" class="hidden">
         
         <main>
-            <!-- 选项卡导航 (更新) -->
+            <!-- 选项卡导航 -->
             <nav class="tabs card">
                 <button class="tab-button active" data-tab="config">API 配置</button>
                 <button class="tab-button" data-tab="stats">请求统计</button>
@@ -52,32 +51,17 @@
 
             <!-- 
               选项卡内容
-              (每个 tab-content 现在都是一个卡片)
             -->
 
             <!-- 1. API 配置 -->
             <section id="config-tab" class="tab-content card active">
                 <h2>API 配置项</h2>
-                <div class="table-container">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>优先级</th>
-                                <th>URL</th>
-                                <th>Key (遮罩)</th>
-                                <th>覆盖 Model</th>
-                                <th>ID</th>
-                                <th>操作</th>
-                            </tr>
-                        </thead>
-                        <tbody id="config-table-body">
-                            <!-- JS 动态填充 -->
-                            <tr><td colspan="6">加载中...</td></tr>
-                        </tbody>
-                    </table>
+                <!-- [重构] 配置项将按方案动态生成到这里 -->
+                <div id="config-schemes-container">
+                    <p>加载中...</p>
                 </div>
 
-                <!-- (表单现在是内嵌卡片) -->
+                <!-- [重构] 表单现在是内嵌卡片 -->
                 <div class="card form-card">
                     <h3 id="form-title">添加新配置</h3>
                     <form id="config-form">
@@ -85,11 +69,16 @@
                         <input type="hidden" id="config-id">
                         
                         <div class="form-grid">
+                            <!-- [新增] 方案名称输入框 -->
+                            <div class="input-group">
+                                <label for="config-scheme">方案名称 (作为 Model Name)</label>
+                                <input type="text" id="config-scheme" placeholder="例如: gpt-4-turbo" required>
+                            </div>
                             <div class="input-group">
                                 <label for="config-priority">优先级 (数字越小越优先)</label>
                                 <input type="number" id="config-priority" placeholder="例如: 1" required>
                             </div>
-                            <div class="input-group">
+                            <div class="input-group full-span">
                                 <label for="config-url">API 终端 URL</label>
                                 <input type="text" id="config-url" placeholder="https://api.openai.com/v1" required>
                             </div>
@@ -100,6 +89,15 @@
                             <div class="input-group full-span">
                                 <label for="config-model">覆盖 Model (选填)</label>
                                 <input type="text" id="config-model" placeholder="留空则使用原始请求的 model">
+                            </div>
+                            <!-- [新增] 熔断机制输入框 -->
+                            <div class="input-group">
+                                <label for="config-failure-threshold">连续失败阈值 (选填)</label>
+                                <input type="number" id="config-failure-threshold" placeholder="例如: 3 (次)">
+                            </div>
+                            <div class="input-group">
+                                <label for="config-disable-duration">禁用时长 (秒, 选填)</label>
+                                <input type="number" id="config-disable-duration" placeholder="例如: 1800 (秒)">
                             </div>
                         </div>
                         <div class="form-actions">
@@ -132,7 +130,27 @@
                     </div>
                 </div>
 
-                <h3 class="mt-2">按配置统计</h3>
+                <h3 class="mt-2">按配置统计 (历史总计)</h3>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>URL</th>
+                                <th class="success-text">成功</th>
+                                <th class="fail-text">失败</th>
+                                <th>连续失败</th>
+                                <th>禁用至</th>
+                            </tr>
+                        </thead>
+                        <tbody id="stats-by-config-body">
+                            <tr><td colspan="6">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- [新增] 今日按配置统计表格 -->
+                <h3 class="mt-2">按配置统计 (今日)</h3>
                 <div class="table-container">
                     <table>
                         <thead>
@@ -143,8 +161,7 @@
                                 <th class="fail-text">失败</th>
                             </tr>
                         </thead>
-                        <tbody id="stats-by-config-body">
-                            <!-- JS 动态填充 -->
+                        <tbody id="stats-today-by-config-body">
                             <tr><td colspan="4">加载中...</td></tr>
                         </tbody>
                     </table>
