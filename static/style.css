@@ -181,7 +181,8 @@ td small {
 }
 input[type="text"],
 input[type="password"],
-input[type="number"] {
+input[type="number"],
+textarea {
     width: 100%;
     padding: 0.75rem;
     font-size: 1rem;
@@ -191,7 +192,8 @@ input[type="number"] {
 }
 input[type="text"]:focus,
 input[type="password"]:focus,
-input[type="number"]:focus {
+input[type="number"]:focus,
+textarea:focus {
     outline: none;
     border-color: var(--color-primary);
     box-shadow: 0 0 0 3px var(--color-primary-light);
@@ -203,6 +205,11 @@ input[type="number"]::-webkit-outer-spin-button {
 }
 input[type="number"] {
   -moz-appearance: textfield;
+}
+textarea {
+    min-height: 8rem;
+    resize: vertical;
+    font-family: Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 }
 
 
@@ -377,6 +384,14 @@ td .edit-btn:hover {
 .scheme-header h3 small {
     font-weight: 400;
     color: var(--color-text-light);
+}
+
+.preset-card {
+    margin-top: 1rem;
+    padding: 1rem;
+    background-color: var(--color-white);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
 }
 
 /* 移动端适配 */

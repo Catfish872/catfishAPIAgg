@@ -99,7 +99,34 @@
                                 <label for="config-disable-duration">禁用时长 (秒, 选填)</label>
                                 <input type="number" id="config-disable-duration" placeholder="例如: 1800 (秒)">
                             </div>
+                            <div class="input-group">
+                                <label for="config-max-retries">失败重试次数 (默认 0)</label>
+                                <input type="number" id="config-max-retries" min="0" placeholder="例如: 2">
+                            </div>
+                            <div class="input-group full-span">
+                                <label for="config-request-overrides">请求参数强制覆盖 JSON (选填)</label>
+                                <textarea id="config-request-overrides" rows="8" placeholder='例如: {"temperature":0.2,"max_tokens":2048,"reasoning":{"effort":"medium"}}'></textarea>
+                                <small>允许任意字段透传，仅校验 JSON 格式。配置后将强制覆盖同名请求参数。</small>
+                            </div>
                         </div>
+
+                        <div class="preset-card">
+                            <h4>参数字段速选（点击加入字段名）</h4>
+                            <div class="table-container">
+                                <table>
+                                    <thead>
+                                        <tr>
+                                            <th>字段名</th>
+                                            <th>类型</th>
+                                            <th>说明</th>
+                                            <th>操作</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="preset-table-body"></tbody>
+                                </table>
+                            </div>
+                        </div>
+
                         <div class="form-actions">
                             <button type="submit" id="save-button" class="button button-primary">保存</button>
                             <button type="button" id="cancel-button" class="button button-secondary hidden">取消</button>

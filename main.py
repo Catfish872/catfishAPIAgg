@@ -62,6 +62,8 @@ class ApiConfigBase(BaseModel):
     url: str = Field(..., description="API 终端地址, e.g., https://api.openai.com/v1")
     api_key: str = Field(..., description="用于该终端的 API Key")
     model: Optional[str] = Field(None, description="要覆盖的模型名称，如果为 null/空，则使用原始请求中的 model")
+    max_retries: Optional[int] = Field(0, description="该配置项失败后的重试次数（默认 0，即不重试）")
+    request_overrides: Optional[Dict[str, Any]] = Field(default_factory=dict, description="转发时强制覆盖到请求体的参数（支持任意 JSON 对象）")
     # [新增] 熔断机制相关配置
     consecutive_failure_threshold: Optional[int] = Field(None, description="连续失败N次后禁用（默认不启用）")
     disable_duration_seconds: Optional[int] = Field(None, description="禁用时长（秒，默认不启用）")
@@ -402,7 +404,12 @@ async def proxy_chat_completions(
     last_error_response = None
 
     for config in attempt_queue:
-        log_message(f"正在尝试方案 '{scheme_name}' 的配置项 ID: {config.id} (Priority: {config.priority})")
+        max_retries = config.max_retries if config.max_retries is not None else 0
+        if max_retries < 0:
+            max_retries = 0
+
+        log_message(
+            f"正在尝试方案 '{scheme_name}' 的配置项 ID: {config.id} (Priority: {config.priority}, MaxRetries: {max_retries})")
 
         # 查找原始分组信息，用于成功后更新轮询状态
         original_group = priority_groups.get(config.priority, [])
@@ -411,7 +418,7 @@ async def proxy_chat_completions(
         except ValueError:
             success_index_in_group = 0  # 理论上不会发生
 
-        # 准备请求
+        # 准备请求（固定部分）
         proxy_url = f"{config.url.rstrip('/')}/chat/completions"
         proxy_headers = {
             "Authorization": f"Bearer {config.api_key}",
@@ -419,89 +426,120 @@ async def proxy_chat_completions(
             "Accept": "application/json" if not is_stream else "text/event-stream"
         }
 
-        proxy_body = request_body.copy()
-        if config.model:
-            proxy_body["model"] = config.model
+        for attempt_no in range(max_retries + 1):
+            response_context = None
+            # 每次重试都从原请求体重新构建，避免脏数据累积
+            proxy_body = request_body.copy()
 
-        response_context = None
-        try:
-            if is_stream:
-                response_context = httpx_client.stream("POST", proxy_url, headers=proxy_headers, json=proxy_body)
-                response = await response_context.__aenter__()
+            # 先应用任意 request_overrides（强制覆盖）
+            request_overrides = config.request_overrides if isinstance(config.request_overrides, dict) else {}
+            if request_overrides:
+                proxy_body.update(request_overrides)
 
-                if response.status_code >= 400:
-                    response_body = await response.aread()
-                    error_text = response_body.decode('utf-8')
-                    log_message(f"配置项 ID: {config.id} 失败 (HTTP {response.status_code}): {error_text}")
-                    last_error = f"HTTP {response.status_code}: {error_text}"
-                    try:
-                        error_content = json.loads(error_text)
-                    except Exception:
-                        error_content = error_text
+            # model 保持配置优先
+            if config.model:
+                proxy_body["model"] = config.model
 
-                    class MockResponse:
-                        def __init__(self, content, status_code_val):
-                            self._content, self.status_code = content, status_code_val
+            try:
+                if is_stream:
+                    response_context = httpx_client.stream("POST", proxy_url, headers=proxy_headers, json=proxy_body)
+                    response = await response_context.__aenter__()
 
-                        def json(self): return self._content if isinstance(self._content, dict) else {
-                            "error": self.text}
+                    if response.status_code >= 400:
+                        response_body = await response.aread()
+                        error_text = response_body.decode('utf-8')
+                        log_message(
+                            f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (HTTP {response.status_code}): {error_text}")
+                        last_error = f"HTTP {response.status_code}: {error_text}"
+                        try:
+                            error_content = json.loads(error_text)
+                        except Exception:
+                            error_content = error_text
 
-                        @property
-                        def text(self): return self._content if isinstance(self._content, str) else str(self._content)
+                        class MockResponse:
+                            def __init__(self, content, status_code_val):
+                                self._content, self.status_code = content, status_code_val
 
-                    last_error_response = MockResponse(error_content, response.status_code)
-                    await update_stats_and_state(config, False, scheme_name, [], 0)
-                    await response_context.__aexit__(None, None, None)
+                            def json(self): return self._content if isinstance(self._content, dict) else {
+                                "error": self.text}
+
+                            @property
+                            def text(self): return self._content if isinstance(self._content, str) else str(
+                                self._content)
+
+                        last_error_response = MockResponse(error_content, response.status_code)
+                        await update_stats_and_state(config, False, scheme_name, [], 0)
+                        await response_context.__aexit__(None, None, None)
+                        response_context = None
+
+                        if attempt_no < max_retries:
+                            log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
+                            continue
+                        break
+
+                    async def final_stream_generator(successful_config, ctx, resp):
+                        try:
+                            async for chunk in resp.aiter_bytes():
+                                yield chunk
+                            log_message(f"配置项 ID: {successful_config.id} 流式请求成功 (流结束)")
+                            await update_stats_and_state(successful_config, True, scheme_name, original_group,
+                                                         success_index_in_group)
+                        except Exception as e:
+                            error_type = type(e).__name__
+                            if "ClientDisconnect" in error_type or "CancelledError" in error_type:
+                                log_message(
+                                    f"配置项 ID: {successful_config.id} 流传输被客户端主动断开 (Type: {error_type})")
+                            else:
+                                log_message(f"配置项 ID: {successful_config.id} 在流传输过程中失败: {repr(e)}")
+                            raise
+                        finally:
+                            await ctx.__aexit__(None, None, None)
+
+                    log_message(
+                        f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次流式请求启动成功 (HTTP {response.status_code})")
+                    response_context_to_pass = response_context
                     response_context = None
+                    return StreamingResponse(
+                        final_stream_generator(config, response_context_to_pass, response),
+                        media_type="text/event-stream"
+                    )
+                else:
+                    response = await httpx_client.post(proxy_url, headers=proxy_headers, json=proxy_body)
+                    response.raise_for_status()
+                    log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次非流式请求成功")
+                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                    return JSONResponse(content=response.json(), status_code=response.status_code)
+
+            except httpx.HTTPStatusError as e:
+                last_error, last_error_response = e, e.response
+                log_message(
+                    f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (HTTP {e.response.status_code}): {e.response.text}")
+                await update_stats_and_state(config, False, scheme_name, [], 0)
+                if attempt_no < max_retries:
+                    log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
                     continue
+                break
+            except httpx.RequestError as e:
+                last_error = e
+                log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (RequestError): {e}")
+                await update_stats_and_state(config, False, scheme_name, [], 0)
+                if attempt_no < max_retries:
+                    log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
+                    continue
+                break
+            except Exception as e:
+                last_error = e
+                log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (Exception): {e}")
+                await update_stats_and_state(config, False, scheme_name, [], 0)
+                if attempt_no < max_retries:
+                    log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
+                    continue
+                break
+            finally:
+                if response_context is not None:
+                    await response_context.__aexit__(None, None, None)
 
-                async def final_stream_generator(successful_config, ctx, resp):
-                    try:
-                        async for chunk in resp.aiter_bytes():
-                            yield chunk
-                        log_message(f"配置项 ID: {successful_config.id} 流式请求成功 (流结束)")
-                        await update_stats_and_state(successful_config, True, scheme_name, original_group,
-                                                     success_index_in_group)
-                    except Exception as e:
-                        error_type = type(e).__name__
-                        if "ClientDisconnect" in error_type or "CancelledError" in error_type:
-                            log_message(
-                                f"配置项 ID: {successful_config.id} 流传输被客户端主动断开 (Type: {error_type})")
-                        else:
-                            log_message(f"配置项 ID: {successful_config.id} 在流传输过程中失败: {repr(e)}")
-                        raise
-                    finally:
-                        await ctx.__aexit__(None, None, None)
-
-                log_message(f"配置项 ID: {config.id} 流式请求启动成功 (HTTP {response.status_code})")
-                response_context_to_pass = response_context
-                response_context = None
-                return StreamingResponse(
-                    final_stream_generator(config, response_context_to_pass, response),
-                    media_type="text/event-stream"
-                )
-            else:
-                response = await httpx_client.post(proxy_url, headers=proxy_headers, json=proxy_body)
-                response.raise_for_status()
-                log_message(f"配置项 ID: {config.id} 非流式请求成功")
-                await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
-                return JSONResponse(content=response.json(), status_code=response.status_code)
-
-        except httpx.HTTPStatusError as e:
-            last_error, last_error_response = e, e.response
-            log_message(f"配置项 ID: {config.id} 失败 (HTTP {e.response.status_code}): {e.response.text}")
-            await update_stats_and_state(config, False, scheme_name, [], 0)
-        except httpx.RequestError as e:
-            last_error = e
-            log_message(f"配置项 ID: {config.id} 失败 (RequestError): {e}")
-            await update_stats_and_state(config, False, scheme_name, [], 0)
-        except Exception as e:
-            last_error = e
-            log_message(f"配置项 ID: {config.id} 失败 (Exception): {e}")
-            await update_stats_and_state(config, False, scheme_name, [], 0)
-        finally:
-            if response_context is not None:
-                await response_context.__aexit__(None, None, None)
+        log_message(f"配置项 ID: {config.id} 已耗尽重试次数，回退到下一配置项")
 
     log_message("所有配置项均尝试失败")
     if last_error_response is not None:

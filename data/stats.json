@@ -1,0 +1,39 @@
+{
+  "total": {
+    "success": 11,
+    "fail": 5
+  },
+  "today": {
+    "date": "2025-12-05",
+    "success": 5,
+    "fail": 3,
+    "by_config_id": {
+      "9146a734-91db-4bee-be28-05b4084c2a06": {
+        "success": 0,
+        "fail": 3
+      },
+      "92dbe836-9141-41da-808b-cafc7a2d4fc3": {
+        "success": 5,
+        "fail": 0
+      }
+    }
+  },
+  "by_config_id": {
+    "92dbe836-9141-41da-808b-cafc7a2d4fc3": {
+      "success": 9,
+      "fail": 0,
+      "consecutive_fails": 0
+    },
+    "9146a734-91db-4bee-be28-05b4084c2a06": {
+      "success": 0,
+      "fail": 5,
+      "consecutive_fails": 3,
+      "disabled_until": "2025-12-05T19:51:37.426904"
+    }
+  },
+  "round_robin_state": {
+    "default": {
+      "2": 0
+    }
+  }
+}

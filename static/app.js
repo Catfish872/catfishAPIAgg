@@ -26,6 +26,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const configModelInput = document.getElementById("config-model");
     const configFailureThresholdInput = document.getElementById("config-failure-threshold");
     const configDisableDurationInput = document.getElementById("config-disable-duration");
+    const configMaxRetriesInput = document.getElementById("config-max-retries");
+    const configRequestOverridesInput = document.getElementById("config-request-overrides");
+    const presetTableBody = document.getElementById("preset-table-body");
     const saveButton = document.getElementById("save-button");
     const cancelButton = document.getElementById("cancel-button");
 
@@ -43,6 +46,21 @@ document.addEventListener("DOMContentLoaded", () => {
     let adminKey = sessionStorage.getItem("catfishAdminKey");
     let statsInterval, logsInterval;
     let allSchemesCache = {}; // 缓存配置数据，用于统计显示
+
+    const PARAMETER_FIELD_PRESETS = [
+        { key: "temperature", type: "number", description: "采样温度，越高越发散", defaultValue: null },
+        { key: "top_p", type: "number", description: "核采样阈值 (0~1)", defaultValue: null },
+        { key: "max_tokens", type: "integer", description: "最大输出 token 数", defaultValue: null },
+        { key: "presence_penalty", type: "number", description: "存在惩罚", defaultValue: null },
+        { key: "frequency_penalty", type: "number", description: "频率惩罚", defaultValue: null },
+        { key: "reasoning_effort", type: "string", description: "思维强度，如 low/medium/high", defaultValue: null },
+        { key: "reasoning", type: "object", description: "推理配置对象，如 { effort: \"high\" }", defaultValue: null },
+        { key: "stream_options", type: "object", description: "流式附加参数，如 { include_usage: true }", defaultValue: null },
+        { key: "response_format", type: "object", description: "输出格式控制", defaultValue: null },
+        { key: "seed", type: "integer", description: "随机种子", defaultValue: null },
+        { key: "tools", type: "array", description: "工具调用定义数组", defaultValue: null },
+        { key: "tool_choice", type: "string", description: "工具选择策略", defaultValue: null }
+    ];
 
     // --- 2. 核心功能函数 ---
 
@@ -146,6 +164,8 @@ document.addEventListener("DOMContentLoaded", () => {
                                 <td>
                                     ${config.consecutive_failure_threshold ? `<strong>${config.consecutive_failure_threshold}次</strong> / ${config.disable_duration_seconds}s` : '<em>(未设置)</em>'}
                                 </td>
+                                <td>${config.max_retries ?? 0}</td>
+                                <td><small>${formatOverridesSummary(config.request_overrides)}</small></td>
                                 <td><small>${config.id}</small></td>
                                 <td>
                                     <button class="button edit-btn">编辑</button>
@@ -155,7 +175,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         `;
                     });
                 } else {
-                    tableRows = `<tr><td colspan="7">该方案下没有配置项</td></tr>`;
+                    tableRows = `<tr><td colspan="9">该方案下没有配置项</td></tr>`;
                 }
 
                 schemeBlock.innerHTML = `
@@ -171,6 +191,8 @@ document.addEventListener("DOMContentLoaded", () => {
                                     <th>Key (遮罩)</th>
                                     <th>覆盖 Model</th>
                                     <th>熔断设置 (失败/时长)</th>
+                                    <th>重试次数</th>
+                                    <th>强制覆盖参数</th>
                                     <th>ID</th>
                                     <th>操作</th>
                                 </tr>
@@ -273,6 +295,8 @@ document.addEventListener("DOMContentLoaded", () => {
         configIdInput.value = "";
         formTitle.textContent = "添加新配置";
         configSchemeInput.disabled = false;
+        configMaxRetriesInput.value = "0";
+        configRequestOverridesInput.value = "{}";
         cancelButton.classList.add("hidden");
     }
 
@@ -288,6 +312,8 @@ document.addEventListener("DOMContentLoaded", () => {
         configModelInput.value = config.model;
         configFailureThresholdInput.value = config.consecutive_failure_threshold;
         configDisableDurationInput.value = config.disable_duration_seconds;
+        configMaxRetriesInput.value = config.max_retries ?? 0;
+        configRequestOverridesInput.value = JSON.stringify(config.request_overrides || {}, null, 2);
         cancelButton.classList.remove("hidden");
         configForm.scrollIntoView({ behavior: "smooth" });
     }
@@ -295,15 +321,36 @@ document.addEventListener("DOMContentLoaded", () => {
     // [重构] 处理表单提交
     async function handleFormSubmit(e) {
         e.preventDefault();
-        
+
         const configId = configIdInput.value;
         const isEditing = !!configId;
-        
+
+        let requestOverrides = {};
+        const overridesText = (configRequestOverridesInput.value || "").trim();
+        if (overridesText) {
+            try {
+                requestOverrides = JSON.parse(overridesText);
+            } catch (err) {
+                alert(`请求参数强制覆盖 JSON 格式错误: ${err.message}`);
+                return;
+            }
+            if (requestOverrides === null || Array.isArray(requestOverrides) || typeof requestOverrides !== "object") {
+                alert("请求参数强制覆盖必须是 JSON 对象，例如 {\"temperature\":0.2}");
+                return;
+            }
+        }
+
+        const retryRaw = configMaxRetriesInput.value;
+        const retryParsed = retryRaw === "" ? 0 : parseInt(retryRaw, 10);
+        const maxRetries = Number.isNaN(retryParsed) || retryParsed < 0 ? 0 : retryParsed;
+
         const data = {
             priority: parseInt(configPriorityInput.value, 10),
             url: configUrlInput.value,
             api_key: configKeyInput.value,
             model: configModelInput.value || null,
+            max_retries: maxRetries,
+            request_overrides: requestOverrides,
             consecutive_failure_threshold: configFailureThresholdInput.value ? parseInt(configFailureThresholdInput.value, 10) : null,
             disable_duration_seconds: configDisableDurationInput.value ? parseInt(configDisableDurationInput.value, 10) : null,
         };
@@ -349,6 +396,58 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function formatOverridesSummary(overrides) {
+        if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) {
+            return "(无)";
+        }
+        const keys = Object.keys(overrides);
+        if (keys.length === 0) {
+            return "(无)";
+        }
+        const preview = keys.slice(0, 4).join(", ");
+        return keys.length > 4 ? `${preview} ...` : preview;
+    }
+
+    function parseOverridesFromTextarea() {
+        const text = (configRequestOverridesInput.value || "").trim();
+        if (!text) return {};
+        const parsed = JSON.parse(text);
+        if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
+            throw new Error("强制覆盖参数必须是 JSON 对象");
+        }
+        return parsed;
+    }
+
+    function applyPresetField(fieldPreset) {
+        try {
+            const currentObj = parseOverridesFromTextarea();
+            if (!(fieldPreset.key in currentObj)) {
+                currentObj[fieldPreset.key] = fieldPreset.defaultValue;
+            }
+            configRequestOverridesInput.value = JSON.stringify(currentObj, null, 2);
+        } catch (err) {
+            alert(`当前 JSON 不是合法对象，无法插入字段: ${err.message}`);
+        }
+    }
+
+    function renderPresetTable() {
+        if (!presetTableBody) return;
+        presetTableBody.innerHTML = "";
+
+        PARAMETER_FIELD_PRESETS.forEach((item) => {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `
+                <td><code>${item.key}</code></td>
+                <td>${item.type}</td>
+                <td>${item.description}</td>
+                <td><button type="button" class="button edit-btn">加入字段</button></td>
+            `;
+            const addBtn = tr.querySelector("button");
+            addBtn.addEventListener("click", () => applyPresetField(item));
+            presetTableBody.appendChild(tr);
+        });
+    }
+
     function init() {
         loginButton.addEventListener("click", handleLogin);
         adminKeyInput.addEventListener("keydown", (e) => {
@@ -367,6 +466,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
         configForm.addEventListener("submit", handleFormSubmit);
         cancelButton.addEventListener("click", resetForm);
+
+        renderPresetTable();
+        resetForm();
 
         if (adminKey) {
             (async () => {
