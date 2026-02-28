@@ -28,6 +28,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const configDisableDurationInput = document.getElementById("config-disable-duration");
     const configMaxRetriesInput = document.getElementById("config-max-retries");
     const configRequestOverridesInput = document.getElementById("config-request-overrides");
+    const configInjectionPositionInput = document.getElementById("config-injection-position");
+    const injectedMessagesEditor = document.getElementById("injected-messages-editor");
+    const addInjectedMessageButton = document.getElementById("add-injected-message-button");
     const presetTableBody = document.getElementById("preset-table-body");
     const saveButton = document.getElementById("save-button");
     const cancelButton = document.getElementById("cancel-button");
@@ -46,6 +49,9 @@ document.addEventListener("DOMContentLoaded", () => {
     let adminKey = sessionStorage.getItem("catfishAdminKey");
     let statsInterval, logsInterval;
     let allSchemesCache = {}; // 缓存配置数据，用于统计显示
+
+    const CONFIG_COLLAPSE_STORAGE_KEY = "catfish_config_scheme_collapsed";
+    const ALLOWED_INJECT_ROLES = ["system", "user", "assistant", "tool"];
 
     const PARAMETER_FIELD_PRESETS = [
         { key: "temperature", type: "number", description: "采样温度，越高越发散", defaultValue: null },
@@ -147,11 +153,15 @@ document.addEventListener("DOMContentLoaded", () => {
                 return;
             }
 
+            const collapsedStateMap = getSchemeCollapseStateMap();
+
             schemeNames.sort().forEach(schemeName => {
                 const configs = schemes[schemeName];
                 const schemeBlock = document.createElement("div");
                 schemeBlock.className = "scheme-block";
-                
+
+                const isCollapsed = !!collapsedStateMap[schemeName];
+
                 let tableRows = '';
                 if (configs.length > 0) {
                     configs.forEach(config => {
@@ -165,6 +175,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                     ${config.consecutive_failure_threshold ? `<strong>${config.consecutive_failure_threshold}次</strong> / ${config.disable_duration_seconds}s` : '<em>(未设置)</em>'}
                                 </td>
                                 <td>${config.max_retries ?? 0}</td>
+                                <td><small>${formatInjectionSummary(config)}</small></td>
                                 <td><small>${formatOverridesSummary(config.request_overrides)}</small></td>
                                 <td><small>${config.id}</small></td>
                                 <td>
@@ -175,14 +186,17 @@ document.addEventListener("DOMContentLoaded", () => {
                         `;
                     });
                 } else {
-                    tableRows = `<tr><td colspan="9">该方案下没有配置项</td></tr>`;
+                    tableRows = `<tr><td colspan="10">该方案下没有配置项</td></tr>`;
                 }
 
                 schemeBlock.innerHTML = `
                     <div class="scheme-header">
-                        <h3>${schemeName} <small>(Model Name)</small></h3>
+                        <h3 class="scheme-title">${schemeName} <small>(Model Name)</small></h3>
+                        <button type="button" class="button button-secondary scheme-toggle-btn" data-scheme-name="${schemeName}">
+                            ${isCollapsed ? "展开" : "收起"}
+                        </button>
                     </div>
-                    <div class="table-container">
+                    <div class="table-container scheme-content ${isCollapsed ? "hidden" : ""}">
                         <table>
                             <thead>
                                 <tr>
@@ -192,6 +206,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                     <th>覆盖 Model</th>
                                     <th>熔断设置 (失败/时长)</th>
                                     <th>重试次数</th>
+                                    <th>注入策略</th>
                                     <th>强制覆盖参数</th>
                                     <th>ID</th>
                                     <th>操作</th>
@@ -202,6 +217,18 @@ document.addEventListener("DOMContentLoaded", () => {
                     </div>
                 `;
                 configSchemesContainer.appendChild(schemeBlock);
+            });
+
+            configSchemesContainer.querySelectorAll('.scheme-toggle-btn').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const schemeName = btn.dataset.schemeName;
+                    const block = btn.closest('.scheme-block');
+                    const content = block.querySelector('.scheme-content');
+                    const nowCollapsed = !content.classList.contains('hidden');
+                    content.classList.toggle('hidden');
+                    btn.textContent = nowCollapsed ? '展开' : '收起';
+                    setSchemeCollapsed(schemeName, nowCollapsed);
+                });
             });
             
             // 为所有新生成的按钮添加事件监听
@@ -296,7 +323,9 @@ document.addEventListener("DOMContentLoaded", () => {
         formTitle.textContent = "添加新配置";
         configSchemeInput.disabled = false;
         configMaxRetriesInput.value = "0";
+        configInjectionPositionInput.value = "prepend";
         configRequestOverridesInput.value = "{}";
+        renderInjectedMessagesEditor([]);
         cancelButton.classList.add("hidden");
     }
 
@@ -314,6 +343,8 @@ document.addEventListener("DOMContentLoaded", () => {
         configDisableDurationInput.value = config.disable_duration_seconds;
         configMaxRetriesInput.value = config.max_retries ?? 0;
         configRequestOverridesInput.value = JSON.stringify(config.request_overrides || {}, null, 2);
+        configInjectionPositionInput.value = config.injection_position || "prepend";
+        renderInjectedMessagesEditor(config.injected_messages || []);
         cancelButton.classList.remove("hidden");
         configForm.scrollIntoView({ behavior: "smooth" });
     }
@@ -351,6 +382,8 @@ document.addEventListener("DOMContentLoaded", () => {
             model: configModelInput.value || null,
             max_retries: maxRetries,
             request_overrides: requestOverrides,
+            injection_position: configInjectionPositionInput.value || "prepend",
+            injected_messages: getInjectedMessagesFromEditor(),
             consecutive_failure_threshold: configFailureThresholdInput.value ? parseInt(configFailureThresholdInput.value, 10) : null,
             disable_duration_seconds: configDisableDurationInput.value ? parseInt(configDisableDurationInput.value, 10) : null,
         };
@@ -396,6 +429,17 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function formatInjectionSummary(config) {
+        const messages = Array.isArray(config.injected_messages) ? config.injected_messages : [];
+        if (messages.length === 0) {
+            return "(无)";
+        }
+        const positionLabel = (config.injection_position || "prepend") === "append" ? "最后" : "最前";
+        const rolesPreview = messages.slice(0, 3).map(m => m.role).join(", ");
+        const more = messages.length > 3 ? " ..." : "";
+        return `${positionLabel} / ${messages.length}条 / ${rolesPreview}${more}`;
+    }
+
     function formatOverridesSummary(overrides) {
         if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) {
             return "(无)";
@@ -428,6 +472,82 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch (err) {
             alert(`当前 JSON 不是合法对象，无法插入字段: ${err.message}`);
         }
+    }
+
+    function getSchemeCollapseStateMap() {
+        try {
+            const raw = localStorage.getItem(CONFIG_COLLAPSE_STORAGE_KEY);
+            if (!raw) return {};
+            const parsed = JSON.parse(raw);
+            return parsed && typeof parsed === "object" ? parsed : {};
+        } catch {
+            return {};
+        }
+    }
+
+    function setSchemeCollapsed(schemeName, isCollapsed) {
+        const state = getSchemeCollapseStateMap();
+        state[schemeName] = !!isCollapsed;
+        localStorage.setItem(CONFIG_COLLAPSE_STORAGE_KEY, JSON.stringify(state));
+    }
+
+    function createInjectedMessageRow(message = { role: "system", content: "" }) {
+        const row = document.createElement("div");
+        row.className = "injected-message-row";
+
+        const role = ALLOWED_INJECT_ROLES.includes(message?.role) ? message.role : "system";
+        const content = message?.content ?? "";
+
+        const roleSelect = document.createElement("select");
+        roleSelect.className = "injected-role-select";
+        ALLOWED_INJECT_ROLES.forEach(r => {
+            const option = document.createElement("option");
+            option.value = r;
+            option.textContent = r;
+            if (r === role) option.selected = true;
+            roleSelect.appendChild(option);
+        });
+
+        const contentInput = document.createElement("textarea");
+        contentInput.className = "injected-content-input";
+        contentInput.rows = 2;
+        contentInput.placeholder = "输入注入内容...";
+        contentInput.value = String(content);
+
+        const deleteBtn = document.createElement("button");
+        deleteBtn.type = "button";
+        deleteBtn.className = "button danger injected-delete-btn";
+        deleteBtn.textContent = "删除";
+        deleteBtn.addEventListener("click", () => {
+            row.remove();
+        });
+
+        row.appendChild(roleSelect);
+        row.appendChild(contentInput);
+        row.appendChild(deleteBtn);
+
+        return row;
+    }
+
+    function renderInjectedMessagesEditor(messages) {
+        if (!injectedMessagesEditor) return;
+        injectedMessagesEditor.innerHTML = "";
+        const list = Array.isArray(messages) ? messages : [];
+        list.forEach(msg => injectedMessagesEditor.appendChild(createInjectedMessageRow(msg)));
+    }
+
+    function getInjectedMessagesFromEditor() {
+        if (!injectedMessagesEditor) return [];
+        const rows = injectedMessagesEditor.querySelectorAll(".injected-message-row");
+        const result = [];
+        rows.forEach(row => {
+            const role = row.querySelector(".injected-role-select")?.value;
+            const content = row.querySelector(".injected-content-input")?.value ?? "";
+            if (!ALLOWED_INJECT_ROLES.includes(role)) return;
+            if (content.trim() === "") return;
+            result.push({ role, content });
+        });
+        return result;
     }
 
     function renderPresetTable() {
@@ -466,6 +586,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
         configForm.addEventListener("submit", handleFormSubmit);
         cancelButton.addEventListener("click", resetForm);
+        addInjectedMessageButton.addEventListener("click", () => {
+            injectedMessagesEditor.appendChild(createInjectedMessageRow());
+        });
 
         renderPresetTable();
         resetForm();

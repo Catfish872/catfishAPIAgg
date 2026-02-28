@@ -182,6 +182,7 @@ td small {
 input[type="text"],
 input[type="password"],
 input[type="number"],
+select,
 textarea {
     width: 100%;
     padding: 0.75rem;
@@ -193,6 +194,7 @@ textarea {
 input[type="text"]:focus,
 input[type="password"]:focus,
 input[type="number"]:focus,
+select:focus,
 textarea:focus {
     outline: none;
     border-color: var(--color-primary);
@@ -375,6 +377,10 @@ td .edit-btn:hover {
     padding-bottom: 0.5rem;
     border-bottom: 2px solid var(--color-primary-light);
     margin-bottom: 1rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
 }
 .scheme-header h3 {
     font-size: 1.25rem;
@@ -392,6 +398,24 @@ td .edit-btn:hover {
     background-color: var(--color-white);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-lg);
+}
+
+.injected-messages-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+}
+
+.injected-message-row {
+    display: grid;
+    grid-template-columns: 150px 1fr auto;
+    gap: 0.5rem;
+    align-items: start;
+}
+
+.injected-message-row .injected-content-input {
+    min-height: 3rem;
 }
 
 /* 移动端适配 */
@@ -413,5 +437,8 @@ td .edit-btn:hover {
     }
     #top-bar h1 {
         font-size: 1.1rem;
+    }
+    .injected-message-row {
+        grid-template-columns: 1fr;
     }
 }

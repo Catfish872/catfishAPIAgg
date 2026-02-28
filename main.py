@@ -8,7 +8,7 @@ import json
 import uuid
 from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Literal
 from itertools import groupby
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Header, APIRouter
@@ -56,6 +56,12 @@ app = FastAPI(
 
 # --- 2. Pydantic 数据模型 ---
 
+class InjectedMessage(BaseModel):
+    """配置项注入消息"""
+    role: Literal["system", "user", "assistant", "tool"] = Field(..., description="消息角色")
+    content: str = Field(..., description="消息内容")
+
+
 class ApiConfigBase(BaseModel):
     """API 配置的基础模型 (用于创建/更新)"""
     priority: int = Field(..., description="优先级，数字越小越优先")
@@ -64,6 +70,8 @@ class ApiConfigBase(BaseModel):
     model: Optional[str] = Field(None, description="要覆盖的模型名称，如果为 null/空，则使用原始请求中的 model")
     max_retries: Optional[int] = Field(0, description="该配置项失败后的重试次数（默认 0，即不重试）")
     request_overrides: Optional[Dict[str, Any]] = Field(default_factory=dict, description="转发时强制覆盖到请求体的参数（支持任意 JSON 对象）")
+    injection_position: Optional[Literal["prepend", "append"]] = Field("prepend", description="注入消息位置：prepend=最前，append=最后")
+    injected_messages: Optional[List[InjectedMessage]] = Field(default_factory=list, description="按顺序注入到 messages 的消息列表")
     # [新增] 熔断机制相关配置
     consecutive_failure_threshold: Optional[int] = Field(None, description="连续失败N次后禁用（默认不启用）")
     disable_duration_seconds: Optional[int] = Field(None, description="禁用时长（秒，默认不启用）")
@@ -327,6 +335,38 @@ async def get_models(auth: bool = Depends(verify_key)):
     }
 
 
+def normalize_injected_messages(raw_messages: Any) -> List[Dict[str, str]]:
+    """将 injected_messages 归一化为可直接发往上游的消息列表"""
+    if not isinstance(raw_messages, list):
+        return []
+
+    allowed_roles = {"system", "user", "assistant", "tool"}
+    normalized: List[Dict[str, str]] = []
+
+    for msg in raw_messages:
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content")
+        elif hasattr(msg, "dict"):
+            data = msg.dict()
+            role = data.get("role")
+            content = data.get("content")
+        else:
+            continue
+
+        if role not in allowed_roles:
+            continue
+        if content is None:
+            continue
+
+        normalized.append({
+            "role": role,
+            "content": str(content)
+        })
+
+    return normalized
+
+
 @app.post("/v1/chat/completions", tags=["Proxy"])
 async def proxy_chat_completions(
         request: Request,
@@ -440,6 +480,19 @@ async def proxy_chat_completions(
             if config.model:
                 proxy_body["model"] = config.model
 
+            # 注入消息（可配置最前/最后）
+            injected_messages = normalize_injected_messages(config.injected_messages)
+            if injected_messages:
+                original_messages = proxy_body.get("messages")
+                if not isinstance(original_messages, list):
+                    original_messages = []
+
+                injection_position = config.injection_position or "prepend"
+                if injection_position == "append":
+                    proxy_body["messages"] = original_messages + injected_messages
+                else:
+                    proxy_body["messages"] = injected_messages + original_messages
+
             try:
                 if is_stream:
                     response_context = httpx_client.stream("POST", proxy_url, headers=proxy_headers, json=proxy_body)
@@ -478,10 +531,45 @@ async def proxy_chat_completions(
                         break
 
                     async def final_stream_generator(successful_config, ctx, resp):
+                        pending = bytearray()
+                        total_tokens = None
+
+                        def try_extract_usage_from_sse_line(line_text: str):
+                            nonlocal total_tokens
+                            line_text = line_text.strip()
+                            if not line_text.startswith("data:"):
+                                return
+
+                            payload = line_text[5:].strip()
+                            if payload == "[DONE]":
+                                return
+
+                            try:
+                                data_obj = json.loads(payload)
+                            except Exception:
+                                return
+
+                            usage = data_obj.get("usage")
+                            if isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int):
+                                total_tokens = usage.get("total_tokens")
+
                         try:
                             async for chunk in resp.aiter_bytes():
                                 yield chunk
-                            log_message(f"配置项 ID: {successful_config.id} 流式请求成功 (流结束)")
+                                pending.extend(chunk)
+
+                                while b"\n" in pending:
+                                    line_bytes, _, rest = pending.partition(b"\n")
+                                    pending = bytearray(rest)
+                                    try_extract_usage_from_sse_line(line_bytes.decode("utf-8", errors="ignore"))
+
+                            if pending:
+                                try_extract_usage_from_sse_line(pending.decode("utf-8", errors="ignore"))
+
+                            if total_tokens is not None:
+                                log_message(f"配置项 ID: {successful_config.id} 流式请求成功 (流结束, total_tokens={total_tokens})")
+                            else:
+                                log_message(f"配置项 ID: {successful_config.id} 流式请求成功 (流结束, total_tokens=未知)")
                             await update_stats_and_state(successful_config, True, scheme_name, original_group,
                                                          success_index_in_group)
                         except Exception as e:
@@ -506,9 +594,16 @@ async def proxy_chat_completions(
                 else:
                     response = await httpx_client.post(proxy_url, headers=proxy_headers, json=proxy_body)
                     response.raise_for_status()
-                    log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次非流式请求成功")
+                    response_json = response.json()
+                    usage = response_json.get("usage") if isinstance(response_json, dict) else None
+                    total_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+
+                    if total_tokens is not None:
+                        log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次非流式请求成功 (total_tokens={total_tokens})")
+                    else:
+                        log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次非流式请求成功 (total_tokens=未知)")
                     await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
-                    return JSONResponse(content=response.json(), status_code=response.status_code)
+                    return JSONResponse(content=response_json, status_code=response.status_code)
 
             except httpx.HTTPStatusError as e:
                 last_error, last_error_response = e, e.response

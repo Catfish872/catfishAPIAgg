@@ -103,6 +103,19 @@
                                 <label for="config-max-retries">失败重试次数 (默认 0)</label>
                                 <input type="number" id="config-max-retries" min="0" placeholder="例如: 2">
                             </div>
+                            <div class="input-group">
+                                <label for="config-injection-position">注入位置</label>
+                                <select id="config-injection-position">
+                                    <option value="prepend">最前</option>
+                                    <option value="append">最后</option>
+                                </select>
+                            </div>
+                            <div class="input-group full-span">
+                                <label>注入消息 (按顺序生效)</label>
+                                <div id="injected-messages-editor" class="injected-messages-editor"></div>
+                                <button type="button" id="add-injected-message-button" class="button button-secondary">+ 添加注入消息</button>
+                                <small>支持 role: system / user / assistant / tool。选择“最后 + assistant”可实现预填充效果。</small>
+                            </div>
                             <div class="input-group full-span">
                                 <label for="config-request-overrides">请求参数强制覆盖 JSON (选填)</label>
                                 <textarea id="config-request-overrides" rows="8" placeholder='例如: {"temperature":0.2,"max_tokens":2048,"reasoning":{"effort":"medium"}}'></textarea>
