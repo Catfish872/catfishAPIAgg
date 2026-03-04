@@ -449,20 +449,36 @@ def resolve_stream_modes(external_is_stream: bool, strategy: Optional[str]) -> D
     """根据外部请求模式与配置策略，决定上游请求模式和下游返回模式。"""
     normalized_strategy = strategy or "passthrough"
 
+    # 假非流：仅当外部是非流请求时才转换；外部本来是流式则不变动
     if normalized_strategy == "force_fake_non_stream":
+        if not external_is_stream:
+            return {
+                "strategy": normalized_strategy,
+                "upstream_is_stream": True,
+                "downstream_is_stream": False,
+                "mode_label": "假非流"
+            }
         return {
-            "strategy": normalized_strategy,
+            "strategy": "passthrough",
             "upstream_is_stream": True,
-            "downstream_is_stream": False,
-            "mode_label": "假非流"
+            "downstream_is_stream": True,
+            "mode_label": "不变动"
         }
 
+    # 假流式：仅当外部是流式请求时才转换；外部本来是非流则不变动
     if normalized_strategy == "force_fake_stream":
+        if external_is_stream:
+            return {
+                "strategy": normalized_strategy,
+                "upstream_is_stream": False,
+                "downstream_is_stream": True,
+                "mode_label": "假流式"
+            }
         return {
-            "strategy": normalized_strategy,
+            "strategy": "passthrough",
             "upstream_is_stream": False,
-            "downstream_is_stream": True,
-            "mode_label": "假流式"
+            "downstream_is_stream": False,
+            "mode_label": "不变动"
         }
 
     return {
