@@ -335,6 +335,21 @@ textarea {
 }
 
 /* --- 8. 日志 --- */
+.log-settings-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 0.75rem;
+}
+
+.log-settings-row label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-weight: 500;
+}
+
 .logs-container {
     background-color: #1f2937;
     color: #f3f4f6;

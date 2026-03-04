@@ -104,6 +104,14 @@
                                 <input type="number" id="config-max-retries" min="0" placeholder="例如: 2">
                             </div>
                             <div class="input-group">
+                                <label for="config-stream-mode-strategy">流模式策略</label>
+                                <select id="config-stream-mode-strategy">
+                                    <option value="passthrough">不变动（透传）</option>
+                                    <option value="force_fake_non_stream">假非流（上游流式，下游非流）</option>
+                                    <option value="force_fake_stream">假流式（上游非流，下游流式）</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
                                 <label for="config-injection-position">注入位置</label>
                                 <select id="config-injection-position">
                                     <option value="prepend">最前</option>
@@ -211,6 +219,13 @@
             <!-- 3. 实时日志 -->
             <section id="logs-tab" class="tab-content card">
                 <h2>实时日志 (最新 200 条)</h2>
+                <div class="log-settings-row">
+                    <label>
+                        <input type="checkbox" id="toggle-full-request-log">
+                        显示完整请求体日志
+                    </label>
+                    <small id="full-request-log-status"></small>
+                </div>
                 <div class="logs-container">
                     <pre id="logs-content">加载中...</pre>
                 </div>

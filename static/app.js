@@ -29,6 +29,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const configMaxRetriesInput = document.getElementById("config-max-retries");
     const configRequestOverridesInput = document.getElementById("config-request-overrides");
     const configInjectionPositionInput = document.getElementById("config-injection-position");
+    const configStreamModeStrategyInput = document.getElementById("config-stream-mode-strategy");
     const injectedMessagesEditor = document.getElementById("injected-messages-editor");
     const addInjectedMessageButton = document.getElementById("add-injected-message-button");
     const presetTableBody = document.getElementById("preset-table-body");
@@ -45,13 +46,22 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // 日志 Tab
     const logsContent = document.getElementById("logs-content");
+    const toggleFullRequestLogCheckbox = document.getElementById("toggle-full-request-log");
+    const fullRequestLogStatus = document.getElementById("full-request-log-status");
 
     let adminKey = sessionStorage.getItem("catfishAdminKey");
     let statsInterval, logsInterval;
     let allSchemesCache = {}; // 缓存配置数据，用于统计显示
+    let isSyncingLogToggle = false;
 
     const CONFIG_COLLAPSE_STORAGE_KEY = "catfish_config_scheme_collapsed";
     const ALLOWED_INJECT_ROLES = ["system", "user", "assistant", "tool"];
+
+    const STREAM_STRATEGY_LABEL_MAP = {
+        passthrough: "不变动（透传）",
+        force_fake_non_stream: "假非流",
+        force_fake_stream: "假流式"
+    };
 
     const PARAMETER_FIELD_PRESETS = [
         { key: "temperature", type: "number", description: "采样温度，越高越发散", defaultValue: null },
@@ -135,6 +145,7 @@ document.addEventListener("DOMContentLoaded", () => {
         loadConfigs();
         loadStats();
         loadLogs();
+        loadLogSettings();
     }
 
     // [重构] 加载并渲染所有方案配置
@@ -175,6 +186,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                     ${config.consecutive_failure_threshold ? `<strong>${config.consecutive_failure_threshold}次</strong> / ${config.disable_duration_seconds}s` : '<em>(未设置)</em>'}
                                 </td>
                                 <td>${config.max_retries ?? 0}</td>
+                                <td><small>${formatStreamModeStrategy(config.stream_mode_strategy)}</small></td>
                                 <td><small>${formatInjectionSummary(config)}</small></td>
                                 <td><small>${formatOverridesSummary(config.request_overrides)}</small></td>
                                 <td><small>${config.id}</small></td>
@@ -186,7 +198,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         `;
                     });
                 } else {
-                    tableRows = `<tr><td colspan="10">该方案下没有配置项</td></tr>`;
+                    tableRows = `<tr><td colspan="11">该方案下没有配置项</td></tr>`;
                 }
 
                 schemeBlock.innerHTML = `
@@ -206,6 +218,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                     <th>覆盖 Model</th>
                                     <th>熔断设置 (失败/时长)</th>
                                     <th>重试次数</th>
+                                    <th>流模式策略</th>
                                     <th>注入策略</th>
                                     <th>强制覆盖参数</th>
                                     <th>ID</th>
@@ -317,6 +330,49 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    async function loadLogSettings() {
+        if (!toggleFullRequestLogCheckbox) return;
+        try {
+            const response = await authedFetch("/admin/settings/logs");
+            if (!response || !response.ok) return;
+            const settings = await response.json();
+            isSyncingLogToggle = true;
+            toggleFullRequestLogCheckbox.checked = !!settings.show_full_request_body;
+            if (fullRequestLogStatus) {
+                fullRequestLogStatus.textContent = settings.show_full_request_body ? "当前：已开启" : "当前：已关闭";
+            }
+        } catch (err) {
+            console.error("加载日志设置失败:", err);
+        } finally {
+            isSyncingLogToggle = false;
+        }
+    }
+
+    async function updateLogSettings(enabled) {
+        if (!toggleFullRequestLogCheckbox) return;
+        try {
+            const response = await authedFetch("/admin/settings/logs", {
+                method: "PUT",
+                body: JSON.stringify({ show_full_request_body: !!enabled })
+            });
+            if (!response || !response.ok) {
+                throw new Error(`HTTP error! status: ${response?.status}`);
+            }
+            const updated = await response.json();
+            isSyncingLogToggle = true;
+            toggleFullRequestLogCheckbox.checked = !!updated.show_full_request_body;
+            if (fullRequestLogStatus) {
+                fullRequestLogStatus.textContent = updated.show_full_request_body ? "当前：已开启" : "当前：已关闭";
+            }
+        } catch (err) {
+            console.error("更新日志设置失败:", err);
+            alert(`更新日志设置失败: ${err.message}`);
+            await loadLogSettings();
+        } finally {
+            isSyncingLogToggle = false;
+        }
+    }
+
     function resetForm() {
         configForm.reset();
         configIdInput.value = "";
@@ -324,6 +380,7 @@ document.addEventListener("DOMContentLoaded", () => {
         configSchemeInput.disabled = false;
         configMaxRetriesInput.value = "0";
         configInjectionPositionInput.value = "prepend";
+        configStreamModeStrategyInput.value = "passthrough";
         configRequestOverridesInput.value = "{}";
         renderInjectedMessagesEditor([]);
         cancelButton.classList.add("hidden");
@@ -344,6 +401,7 @@ document.addEventListener("DOMContentLoaded", () => {
         configMaxRetriesInput.value = config.max_retries ?? 0;
         configRequestOverridesInput.value = JSON.stringify(config.request_overrides || {}, null, 2);
         configInjectionPositionInput.value = config.injection_position || "prepend";
+        configStreamModeStrategyInput.value = config.stream_mode_strategy || "passthrough";
         renderInjectedMessagesEditor(config.injected_messages || []);
         cancelButton.classList.remove("hidden");
         configForm.scrollIntoView({ behavior: "smooth" });
@@ -383,6 +441,7 @@ document.addEventListener("DOMContentLoaded", () => {
             max_retries: maxRetries,
             request_overrides: requestOverrides,
             injection_position: configInjectionPositionInput.value || "prepend",
+            stream_mode_strategy: configStreamModeStrategyInput.value || "passthrough",
             injected_messages: getInjectedMessagesFromEditor(),
             consecutive_failure_threshold: configFailureThresholdInput.value ? parseInt(configFailureThresholdInput.value, 10) : null,
             disable_duration_seconds: configDisableDurationInput.value ? parseInt(configDisableDurationInput.value, 10) : null,
@@ -427,6 +486,11 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch (err) {
             alert(`删除时发生错误: ${err.message}`);
         }
+    }
+
+    function formatStreamModeStrategy(strategy) {
+        const normalized = strategy || "passthrough";
+        return STREAM_STRATEGY_LABEL_MAP[normalized] || normalized;
     }
 
     function formatInjectionSummary(config) {
@@ -589,6 +653,12 @@ document.addEventListener("DOMContentLoaded", () => {
         addInjectedMessageButton.addEventListener("click", () => {
             injectedMessagesEditor.appendChild(createInjectedMessageRow());
         });
+        if (toggleFullRequestLogCheckbox) {
+            toggleFullRequestLogCheckbox.addEventListener("change", async (e) => {
+                if (isSyncingLogToggle) return;
+                await updateLogSettings(e.target.checked);
+            });
+        }
 
         renderPresetTable();
         resetForm();

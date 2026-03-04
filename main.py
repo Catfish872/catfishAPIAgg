@@ -39,6 +39,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # 内存日志 (deque 是线程/异步安全的)
 log_deque = collections.deque(maxlen=200)
 
+# 日志显示配置
+show_full_request_body = False
+
 # 异步文件读写锁
 file_lock = asyncio.Lock()
 
@@ -72,6 +75,10 @@ class ApiConfigBase(BaseModel):
     request_overrides: Optional[Dict[str, Any]] = Field(default_factory=dict, description="转发时强制覆盖到请求体的参数（支持任意 JSON 对象）")
     injection_position: Optional[Literal["prepend", "append"]] = Field("prepend", description="注入消息位置：prepend=最前，append=最后")
     injected_messages: Optional[List[InjectedMessage]] = Field(default_factory=list, description="按顺序注入到 messages 的消息列表")
+    stream_mode_strategy: Optional[Literal["passthrough", "force_fake_non_stream", "force_fake_stream"]] = Field(
+        "passthrough",
+        description="流模式策略：passthrough=不变动，force_fake_non_stream=假非流，force_fake_stream=假流式"
+    )
     # [新增] 熔断机制相关配置
     consecutive_failure_threshold: Optional[int] = Field(None, description="连续失败N次后禁用（默认不启用）")
     disable_duration_seconds: Optional[int] = Field(None, description="禁用时长（秒，默认不启用）")
@@ -85,6 +92,11 @@ class ApiConfig(ApiConfigBase):
 class ApiConfigCreate(ApiConfigBase):
     """用于创建配置项的 Pydantic 模型，增加了 scheme_name"""
     scheme_name: str = Field("default", description="配置项所属的方案名称")
+
+
+class LogSettingsUpdate(BaseModel):
+    """日志展示设置"""
+    show_full_request_body: bool = Field(..., description="是否在日志中显示完整请求体")
 
 
 # --- 3. 辅助函数 (日志, JSON I/O, 统计) ---
@@ -367,6 +379,216 @@ def normalize_injected_messages(raw_messages: Any) -> List[Dict[str, str]]:
     return normalized
 
 
+def extract_total_tokens(payload: Any) -> Optional[int]:
+    """兼容 OpenAI / Claude / Gemini 等常见响应结构的总 token 提取。"""
+
+    def as_int(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        return value if isinstance(value, int) else None
+
+    def iter_nodes(obj: Any, max_depth: int = 6):
+        stack = [(obj, 0)]
+        while stack:
+            current, depth = stack.pop()
+            if depth > max_depth:
+                continue
+
+            if isinstance(current, dict):
+                yield current
+                for v in current.values():
+                    if isinstance(v, (dict, list)):
+                        stack.append((v, depth + 1))
+            elif isinstance(current, list):
+                for item in current:
+                    if isinstance(item, (dict, list)):
+                        stack.append((item, depth + 1))
+
+    # 1) 先尝试各种“总量字段”
+    total_keys = [
+        "total_tokens",
+        "totalTokenCount",
+        "total_token_count",
+        "token_count"
+    ]
+    for node in iter_nodes(payload):
+        for key in total_keys:
+            val = as_int(node.get(key))
+            if val is not None:
+                return val
+
+    # 2) 再尝试可求和字段
+    pair_keys = [
+        ("prompt_tokens", "completion_tokens"),          # OpenAI 兼容
+        ("input_tokens", "output_tokens"),              # Claude 常见
+        ("promptTokenCount", "candidatesTokenCount"),   # Gemini 常见
+        ("inputTokenCount", "outputTokenCount"),
+        ("prompt_token_count", "completion_token_count"),
+        ("input_token_count", "output_token_count")
+    ]
+
+    for node in iter_nodes(payload):
+        for a, b in pair_keys:
+            va = as_int(node.get(a))
+            vb = as_int(node.get(b))
+            if va is not None and vb is not None:
+                total = va + vb
+
+                # Gemini 常见附加字段，存在则叠加
+                for extra_key in ["toolUsePromptTokenCount", "thoughtsTokenCount", "cachedContentTokenCount"]:
+                    extra_val = as_int(node.get(extra_key))
+                    if extra_val is not None:
+                        total += extra_val
+
+                return total
+
+    return None
+
+
+def resolve_stream_modes(external_is_stream: bool, strategy: Optional[str]) -> Dict[str, Any]:
+    """根据外部请求模式与配置策略，决定上游请求模式和下游返回模式。"""
+    normalized_strategy = strategy or "passthrough"
+
+    if normalized_strategy == "force_fake_non_stream":
+        return {
+            "strategy": normalized_strategy,
+            "upstream_is_stream": True,
+            "downstream_is_stream": False,
+            "mode_label": "假非流"
+        }
+
+    if normalized_strategy == "force_fake_stream":
+        return {
+            "strategy": normalized_strategy,
+            "upstream_is_stream": False,
+            "downstream_is_stream": True,
+            "mode_label": "假流式"
+        }
+
+    return {
+        "strategy": "passthrough",
+        "upstream_is_stream": external_is_stream,
+        "downstream_is_stream": external_is_stream,
+        "mode_label": "不变动"
+    }
+
+
+def convert_sse_bytes_to_non_stream_json(sse_bytes: bytes) -> Dict[str, Any]:
+    """将 SSE 流完整聚合为一个非流式 OpenAI 兼容响应对象。"""
+    text = sse_bytes.decode("utf-8", errors="ignore")
+    events: List[Dict[str, Any]] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+
+        if isinstance(obj, dict):
+            events.append(obj)
+
+    if not events:
+        raise ValueError("流式响应中未解析到有效 data 事件")
+
+    # 若上游已经给出了完整对象，优先直接返回
+    for obj in reversed(events):
+        choices = obj.get("choices")
+        if obj.get("object") == "chat.completion":
+            return obj
+        if isinstance(choices, list) and choices:
+            first_choice = choices[0]
+            if isinstance(first_choice, dict) and "message" in first_choice:
+                return obj
+
+    first_obj = events[0]
+    usage_obj = None
+    choices_acc: Dict[int, Dict[str, Any]] = {}
+
+    for obj in events:
+        usage_candidate = obj.get("usage")
+        if isinstance(usage_candidate, dict):
+            usage_obj = usage_candidate
+
+        choices = obj.get("choices")
+        if not isinstance(choices, list):
+            continue
+
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+
+            idx = choice.get("index", 0)
+            if not isinstance(idx, int):
+                idx = 0
+
+            state = choices_acc.setdefault(idx, {
+                "index": idx,
+                "role": "assistant",
+                "content": "",
+                "finish_reason": None
+            })
+
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                role = delta.get("role")
+                if isinstance(role, str) and role:
+                    state["role"] = role
+
+                content_piece = delta.get("content")
+                if isinstance(content_piece, str):
+                    state["content"] += content_piece
+
+            message = choice.get("message")
+            if isinstance(message, dict):
+                role = message.get("role")
+                if isinstance(role, str) and role:
+                    state["role"] = role
+
+                content = message.get("content")
+                if isinstance(content, str):
+                    state["content"] = content
+
+            finish_reason = choice.get("finish_reason")
+            if finish_reason is not None:
+                state["finish_reason"] = finish_reason
+
+    if not choices_acc:
+        return events[-1]
+
+    output_choices = []
+    for idx in sorted(choices_acc.keys()):
+        state = choices_acc[idx]
+        output_choices.append({
+            "index": state["index"],
+            "message": {
+                "role": state["role"],
+                "content": state["content"]
+            },
+            "finish_reason": state["finish_reason"]
+        })
+
+    result = {
+        "id": first_obj.get("id") or f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": first_obj.get("created") if isinstance(first_obj.get("created"), int) else int(datetime.now().timestamp()),
+        "model": first_obj.get("model"),
+        "choices": output_choices
+    }
+
+    if isinstance(usage_obj, dict):
+        result["usage"] = usage_obj
+
+    return result
+
+
 @app.post("/v1/chat/completions", tags=["Proxy"])
 async def proxy_chat_completions(
         request: Request,
@@ -381,6 +603,12 @@ async def proxy_chat_completions(
     except Exception:
         log_message("请求体 JSON 解析失败")
         return JSONResponse(status_code=400, content={"error": "无效的 JSON 请求体"})
+
+    if show_full_request_body:
+        try:
+            log_message(f"请求体完整内容: {json.dumps(request_body, ensure_ascii=False)}")
+        except Exception:
+            log_message(f"请求体完整内容(序列化失败，使用字符串): {str(request_body)}")
 
     is_stream = request_body.get("stream", False)
     requested_model = request_body.get("model")
@@ -460,10 +688,15 @@ async def proxy_chat_completions(
 
         # 准备请求（固定部分）
         proxy_url = f"{config.url.rstrip('/')}/chat/completions"
+
+        mode_plan = resolve_stream_modes(is_stream, config.stream_mode_strategy)
+        upstream_is_stream = mode_plan["upstream_is_stream"]
+        downstream_is_stream = mode_plan["downstream_is_stream"]
+
         proxy_headers = {
             "Authorization": f"Bearer {config.api_key}",
             "Content-Type": "application/json",
-            "Accept": "application/json" if not is_stream else "text/event-stream"
+            "Accept": "application/json" if not upstream_is_stream else "text/event-stream"
         }
 
         for attempt_no in range(max_retries + 1):
@@ -494,7 +727,10 @@ async def proxy_chat_completions(
                     proxy_body["messages"] = injected_messages + original_messages
 
             try:
-                if is_stream:
+                # 策略强制覆盖 stream，确保上游请求模式与策略一致
+                proxy_body["stream"] = upstream_is_stream
+
+                if upstream_is_stream:
                     response_context = httpx_client.stream("POST", proxy_url, headers=proxy_headers, json=proxy_body)
                     response = await response_context.__aenter__()
 
@@ -502,7 +738,7 @@ async def proxy_chat_completions(
                         response_body = await response.aread()
                         error_text = response_body.decode('utf-8')
                         log_message(
-                            f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (HTTP {response.status_code}): {error_text}")
+                            f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (HTTP {response.status_code}, 策略={mode_plan['mode_label']}): {error_text}")
                         last_error = f"HTTP {response.status_code}: {error_text}"
                         try:
                             error_content = json.loads(error_text)
@@ -530,80 +766,108 @@ async def proxy_chat_completions(
                             continue
                         break
 
-                    async def final_stream_generator(successful_config, ctx, resp):
-                        pending = bytearray()
-                        total_tokens = None
+                    if downstream_is_stream:
+                        async def final_stream_generator(successful_config, ctx, resp):
+                            pending = bytearray()
+                            total_tokens = None
 
-                        def try_extract_usage_from_sse_line(line_text: str):
-                            nonlocal total_tokens
-                            line_text = line_text.strip()
-                            if not line_text.startswith("data:"):
-                                return
+                            def try_extract_usage_from_sse_line(line_text: str):
+                                nonlocal total_tokens
+                                line_text = line_text.strip()
+                                if not line_text.startswith("data:"):
+                                    return
 
-                            payload = line_text[5:].strip()
-                            if payload == "[DONE]":
-                                return
+                                payload = line_text[5:].strip()
+                                if payload == "[DONE]":
+                                    return
+
+                                try:
+                                    data_obj = json.loads(payload)
+                                except Exception:
+                                    return
+
+                                extracted_total = extract_total_tokens(data_obj)
+                                if extracted_total is not None:
+                                    total_tokens = extracted_total
 
                             try:
-                                data_obj = json.loads(payload)
-                            except Exception:
-                                return
+                                async for chunk in resp.aiter_bytes():
+                                    yield chunk
+                                    pending.extend(chunk)
 
-                            usage = data_obj.get("usage")
-                            if isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int):
-                                total_tokens = usage.get("total_tokens")
+                                    while b"\n" in pending:
+                                        line_bytes, _, rest = pending.partition(b"\n")
+                                        pending = bytearray(rest)
+                                        try_extract_usage_from_sse_line(line_bytes.decode("utf-8", errors="ignore"))
 
-                        try:
-                            async for chunk in resp.aiter_bytes():
-                                yield chunk
-                                pending.extend(chunk)
+                                if pending:
+                                    try_extract_usage_from_sse_line(pending.decode("utf-8", errors="ignore"))
 
-                                while b"\n" in pending:
-                                    line_bytes, _, rest = pending.partition(b"\n")
-                                    pending = bytearray(rest)
-                                    try_extract_usage_from_sse_line(line_bytes.decode("utf-8", errors="ignore"))
+                                if total_tokens is not None:
+                                    log_message(f"配置项 ID: {successful_config.id} 流式请求成功 (流结束, total_tokens={total_tokens}, 策略={mode_plan['mode_label']})")
+                                else:
+                                    log_message(f"配置项 ID: {successful_config.id} 流式请求成功 (流结束, total_tokens=未知, 策略={mode_plan['mode_label']})")
+                                await update_stats_and_state(successful_config, True, scheme_name, original_group,
+                                                             success_index_in_group)
+                            except Exception as e:
+                                error_type = type(e).__name__
+                                if "ClientDisconnect" in error_type or "CancelledError" in error_type:
+                                    log_message(
+                                        f"配置项 ID: {successful_config.id} 流传输被客户端主动断开 (Type: {error_type})")
+                                else:
+                                    log_message(f"配置项 ID: {successful_config.id} 在流传输过程中失败: {repr(e)}")
+                                raise
+                            finally:
+                                await ctx.__aexit__(None, None, None)
 
-                            if pending:
-                                try_extract_usage_from_sse_line(pending.decode("utf-8", errors="ignore"))
+                        log_message(
+                            f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次流式请求启动成功 (HTTP {response.status_code}, 策略={mode_plan['mode_label']})")
+                        response_context_to_pass = response_context
+                        response_context = None
+                        return StreamingResponse(
+                            final_stream_generator(config, response_context_to_pass, response),
+                            media_type="text/event-stream"
+                        )
 
-                            if total_tokens is not None:
-                                log_message(f"配置项 ID: {successful_config.id} 流式请求成功 (流结束, total_tokens={total_tokens})")
-                            else:
-                                log_message(f"配置项 ID: {successful_config.id} 流式请求成功 (流结束, total_tokens=未知)")
-                            await update_stats_and_state(successful_config, True, scheme_name, original_group,
-                                                         success_index_in_group)
-                        except Exception as e:
-                            error_type = type(e).__name__
-                            if "ClientDisconnect" in error_type or "CancelledError" in error_type:
-                                log_message(
-                                    f"配置项 ID: {successful_config.id} 流传输被客户端主动断开 (Type: {error_type})")
-                            else:
-                                log_message(f"配置项 ID: {successful_config.id} 在流传输过程中失败: {repr(e)}")
-                            raise
-                        finally:
-                            await ctx.__aexit__(None, None, None)
+                    # 假非流：上游流式，落地后返回非流
+                    stream_bytes = await response.aread()
+                    merged_json = convert_sse_bytes_to_non_stream_json(stream_bytes)
+                    total_tokens = extract_total_tokens(merged_json)
+                    if total_tokens is not None:
+                        log_message(f"配置项 ID: {config.id} 假非流成功 (total_tokens={total_tokens})")
+                    else:
+                        log_message(f"配置项 ID: {config.id} 假非流成功 (total_tokens=未知)")
 
-                    log_message(
-                        f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次流式请求启动成功 (HTTP {response.status_code})")
-                    response_context_to_pass = response_context
+                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                    await response_context.__aexit__(None, None, None)
                     response_context = None
-                    return StreamingResponse(
-                        final_stream_generator(config, response_context_to_pass, response),
-                        media_type="text/event-stream"
-                    )
-                else:
-                    response = await httpx_client.post(proxy_url, headers=proxy_headers, json=proxy_body)
-                    response.raise_for_status()
-                    response_json = response.json()
-                    usage = response_json.get("usage") if isinstance(response_json, dict) else None
-                    total_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+                    return JSONResponse(content=merged_json, status_code=response.status_code)
+
+                # 上游非流
+                response = await httpx_client.post(proxy_url, headers=proxy_headers, json=proxy_body)
+                response.raise_for_status()
+                response_json = response.json()
+                total_tokens = extract_total_tokens(response_json)
+
+                if downstream_is_stream:
+                    # 假流式：上游非流，返回单条完整 data + [DONE]
+                    async def fake_stream_generator(final_payload: Dict[str, Any]):
+                        yield f"data: {json.dumps(final_payload, ensure_ascii=False)}\n\n".encode("utf-8")
+                        yield b"data: [DONE]\n\n"
 
                     if total_tokens is not None:
-                        log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次非流式请求成功 (total_tokens={total_tokens})")
+                        log_message(f"配置项 ID: {config.id} 假流式成功 (total_tokens={total_tokens})")
                     else:
-                        log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次非流式请求成功 (total_tokens=未知)")
+                        log_message(f"配置项 ID: {config.id} 假流式成功 (total_tokens=未知)")
                     await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
-                    return JSONResponse(content=response_json, status_code=response.status_code)
+                    return StreamingResponse(fake_stream_generator(response_json), media_type="text/event-stream")
+
+                if total_tokens is not None:
+                    log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次非流式请求成功 (total_tokens={total_tokens}, 策略={mode_plan['mode_label']})")
+                else:
+                    log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次非流式请求成功 (total_tokens=未知, 策略={mode_plan['mode_label']})")
+                await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                return JSONResponse(content=response_json, status_code=response.status_code)
 
             except httpx.HTTPStatusError as e:
                 last_error, last_error_response = e, e.response
@@ -737,6 +1001,21 @@ async def get_statistics():
 async def get_logs() -> List[str]:
     """获取最新的 200 条内存日志"""
     return list(log_deque)
+
+
+@admin_router.get("/settings/logs")
+async def get_log_settings() -> Dict[str, bool]:
+    """获取日志展示设置"""
+    return {"show_full_request_body": show_full_request_body}
+
+
+@admin_router.put("/settings/logs")
+async def update_log_settings(settings: LogSettingsUpdate) -> Dict[str, bool]:
+    """更新日志展示设置"""
+    global show_full_request_body
+    show_full_request_body = settings.show_full_request_body
+    log_message(f"管理: 已{'开启' if show_full_request_body else '关闭'}完整请求体日志")
+    return {"show_full_request_body": show_full_request_body}
 
 
 app.include_router(admin_router)
