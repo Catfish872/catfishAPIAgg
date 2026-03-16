@@ -337,9 +337,9 @@ document.addEventListener("DOMContentLoaded", () => {
             if (!response || !response.ok) return;
             const settings = await response.json();
             isSyncingLogToggle = true;
-            toggleFullRequestLogCheckbox.checked = !!settings.show_full_request_body;
+            toggleFullRequestLogCheckbox.checked = !!settings.show_full_response_body;
             if (fullRequestLogStatus) {
-                fullRequestLogStatus.textContent = settings.show_full_request_body ? "当前：已开启" : "当前：已关闭";
+                fullRequestLogStatus.textContent = settings.show_full_response_body ? "当前：已开启" : "当前：已关闭";
             }
         } catch (err) {
             console.error("加载日志设置失败:", err);
@@ -353,16 +353,16 @@ document.addEventListener("DOMContentLoaded", () => {
         try {
             const response = await authedFetch("/admin/settings/logs", {
                 method: "PUT",
-                body: JSON.stringify({ show_full_request_body: !!enabled })
+                body: JSON.stringify({ show_full_response_body: !!enabled })
             });
             if (!response || !response.ok) {
                 throw new Error(`HTTP error! status: ${response?.status}`);
             }
             const updated = await response.json();
             isSyncingLogToggle = true;
-            toggleFullRequestLogCheckbox.checked = !!updated.show_full_request_body;
+            toggleFullRequestLogCheckbox.checked = !!updated.show_full_response_body;
             if (fullRequestLogStatus) {
-                fullRequestLogStatus.textContent = updated.show_full_request_body ? "当前：已开启" : "当前：已关闭";
+                fullRequestLogStatus.textContent = updated.show_full_response_body ? "当前：已开启" : "当前：已关闭";
             }
         } catch (err) {
             console.error("更新日志设置失败:", err);

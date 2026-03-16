@@ -12,7 +12,7 @@ from typing import List, Optional, Any, Dict, Literal
 from itertools import groupby
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Header, APIRouter
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 # --- 1. 全局配置和初始化 ---
@@ -40,7 +40,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 log_deque = collections.deque(maxlen=200)
 
 # 日志显示配置
-show_full_request_body = False
+show_full_response_body = False
 
 # 异步文件读写锁
 file_lock = asyncio.Lock()
@@ -96,7 +96,7 @@ class ApiConfigCreate(ApiConfigBase):
 
 class LogSettingsUpdate(BaseModel):
     """日志展示设置"""
-    show_full_request_body: bool = Field(..., description="是否在日志中显示完整请求体")
+    show_full_response_body: bool = Field(..., description="是否在日志中显示完整响应体")
 
 
 # --- 3. 辅助函数 (日志, JSON I/O, 统计) ---
@@ -614,17 +614,20 @@ async def proxy_chat_completions(
     [重构] OpenAI /v1/chat/completions 代理端点。
     它会根据方案、熔断、轮询和优先级进行故障转移。
     """
+
+    class ClientRequestAborted(Exception):
+        """上游客户端已断开，当前请求应立即停止。"""
+
+    async def ensure_client_connected():
+        if await request.is_disconnected():
+            raise ClientRequestAborted("上游客户端已断开，停止当前请求")
+
     try:
         request_body = await request.json()
     except Exception:
         log_message("请求体 JSON 解析失败")
         return JSONResponse(status_code=400, content={"error": "无效的 JSON 请求体"})
 
-    if show_full_request_body:
-        try:
-            log_message(f"请求体完整内容: {json.dumps(request_body, ensure_ascii=False)}")
-        except Exception:
-            log_message(f"请求体完整内容(序列化失败，使用字符串): {str(request_body)}")
 
     is_stream = request_body.get("stream", False)
     requested_model = request_body.get("model")
@@ -688,6 +691,12 @@ async def proxy_chat_completions(
     last_error_response = None
 
     for config in attempt_queue:
+        try:
+            await ensure_client_connected()
+        except ClientRequestAborted as e:
+            log_message(f"上游客户端已断开，停止继续切换配置重试: {e}")
+            return Response(status_code=499)
+
         max_retries = config.max_retries if config.max_retries is not None else 0
         if max_retries < 0:
             max_retries = 0
@@ -717,6 +726,12 @@ async def proxy_chat_completions(
 
         for attempt_no in range(max_retries + 1):
             response_context = None
+            try:
+                await ensure_client_connected()
+            except ClientRequestAborted as e:
+                log_message(f"上游客户端已断开，停止继续重试: {e}")
+                return Response(status_code=499)
+
             # 每次重试都从原请求体重新构建，避免脏数据累积
             proxy_body = request_body.copy()
 
@@ -743,6 +758,8 @@ async def proxy_chat_completions(
                     proxy_body["messages"] = injected_messages + original_messages
 
             try:
+                await ensure_client_connected()
+
                 # 策略强制覆盖 stream，确保上游请求模式与策略一致
                 proxy_body["stream"] = upstream_is_stream
 
@@ -756,6 +773,8 @@ async def proxy_chat_completions(
                         log_message(
                             f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (HTTP {response.status_code}, 策略={mode_plan['mode_label']}): {error_text}")
                         last_error = f"HTTP {response.status_code}: {error_text}"
+                        if show_full_response_body:
+                            log_message(f"响应体完整内容: {error_text}")
                         try:
                             error_content = json.loads(error_text)
                         except Exception:
@@ -773,6 +792,14 @@ async def proxy_chat_completions(
                                 self._content)
 
                         last_error_response = MockResponse(error_content, response.status_code)
+                        try:
+                            await ensure_client_connected()
+                        except ClientRequestAborted as disconnect_error:
+                            log_message(f"上游客户端已断开，本次下游失败不计入统计且停止重试: {disconnect_error}")
+                            await response_context.__aexit__(None, None, None)
+                            response_context = None
+                            return Response(status_code=499)
+
                         await update_stats_and_state(config, False, scheme_name, [], 0)
                         await response_context.__aexit__(None, None, None)
                         response_context = None
@@ -830,6 +857,7 @@ async def proxy_chat_completions(
                                 if "ClientDisconnect" in error_type or "CancelledError" in error_type:
                                     log_message(
                                         f"配置项 ID: {successful_config.id} 流传输被客户端主动断开 (Type: {error_type})")
+                                    return
                                 else:
                                     log_message(f"配置项 ID: {successful_config.id} 在流传输过程中失败: {repr(e)}")
                                 raise
@@ -849,6 +877,11 @@ async def proxy_chat_completions(
                     stream_bytes = await response.aread()
                     merged_json = convert_sse_bytes_to_non_stream_json(stream_bytes)
                     total_tokens = extract_total_tokens(merged_json)
+                    if show_full_response_body:
+                        try:
+                            log_message(f"响应体完整内容: {json.dumps(merged_json, ensure_ascii=False)}")
+                        except Exception:
+                            log_message(f"响应体完整内容(序列化失败，使用字符串): {str(merged_json)}")
                     if total_tokens is not None:
                         log_message(f"配置项 ID: {config.id} 假非流成功 (total_tokens={total_tokens})")
                     else:
@@ -863,6 +896,11 @@ async def proxy_chat_completions(
                 response = await httpx_client.post(proxy_url, headers=proxy_headers, json=proxy_body)
                 response.raise_for_status()
                 response_json = response.json()
+                if show_full_response_body:
+                    try:
+                        log_message(f"响应体完整内容: {json.dumps(response_json, ensure_ascii=False)}")
+                    except Exception:
+                        log_message(f"响应体完整内容(序列化失败，使用字符串): {str(response_json)}")
                 total_tokens = extract_total_tokens(response_json)
 
                 if downstream_is_stream:
@@ -885,28 +923,71 @@ async def proxy_chat_completions(
                 await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                 return JSONResponse(content=response_json, status_code=response.status_code)
 
+            except ClientRequestAborted as e:
+                log_message(f"上游客户端已断开，停止当前代理请求: {e}")
+                return Response(status_code=499)
+            except asyncio.CancelledError:
+                log_message("当前代理请求已被取消，停止继续重试且不计入后端失败")
+                raise
             except httpx.HTTPStatusError as e:
                 last_error, last_error_response = e, e.response
                 log_message(
                     f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (HTTP {e.response.status_code}): {e.response.text}")
+                if show_full_response_body:
+                    log_message(f"响应体完整内容: {e.response.text}")
+                try:
+                    await ensure_client_connected()
+                except ClientRequestAborted as disconnect_error:
+                    log_message(f"上游客户端已断开，本次下游失败不计入统计且停止重试: {disconnect_error}")
+                    return Response(status_code=499)
                 await update_stats_and_state(config, False, scheme_name, [], 0)
                 if attempt_no < max_retries:
+                    try:
+                        await ensure_client_connected()
+                    except ClientRequestAborted as disconnect_error:
+                        log_message(f"上游客户端已断开，取消后续重试: {disconnect_error}")
+                        return Response(status_code=499)
                     log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
                     continue
                 break
             except httpx.RequestError as e:
                 last_error = e
                 log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (RequestError): {e}")
+                try:
+                    await ensure_client_connected()
+                except ClientRequestAborted as disconnect_error:
+                    log_message(f"上游客户端已断开，本次下游失败不计入统计且停止重试: {disconnect_error}")
+                    return Response(status_code=499)
                 await update_stats_and_state(config, False, scheme_name, [], 0)
                 if attempt_no < max_retries:
+                    try:
+                        await ensure_client_connected()
+                    except ClientRequestAborted as disconnect_error:
+                        log_message(f"上游客户端已断开，取消后续重试: {disconnect_error}")
+                        return Response(status_code=499)
                     log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
                     continue
                 break
             except Exception as e:
+                error_type = type(e).__name__
+                if "ClientDisconnect" in error_type or "CancelledError" in error_type:
+                    log_message(f"检测到上游客户端已断开/请求被取消，停止继续重试 (Type: {error_type})")
+                    return Response(status_code=499)
+
                 last_error = e
                 log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (Exception): {e}")
+                try:
+                    await ensure_client_connected()
+                except ClientRequestAborted as disconnect_error:
+                    log_message(f"上游客户端已断开，本次下游失败不计入统计且停止重试: {disconnect_error}")
+                    return Response(status_code=499)
                 await update_stats_and_state(config, False, scheme_name, [], 0)
                 if attempt_no < max_retries:
+                    try:
+                        await ensure_client_connected()
+                    except ClientRequestAborted as disconnect_error:
+                        log_message(f"上游客户端已断开，取消后续重试: {disconnect_error}")
+                        return Response(status_code=499)
                     log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
                     continue
                 break
@@ -1022,16 +1103,16 @@ async def get_logs() -> List[str]:
 @admin_router.get("/settings/logs")
 async def get_log_settings() -> Dict[str, bool]:
     """获取日志展示设置"""
-    return {"show_full_request_body": show_full_request_body}
+    return {"show_full_response_body": show_full_response_body}
 
 
 @admin_router.put("/settings/logs")
 async def update_log_settings(settings: LogSettingsUpdate) -> Dict[str, bool]:
     """更新日志展示设置"""
-    global show_full_request_body
-    show_full_request_body = settings.show_full_request_body
-    log_message(f"管理: 已{'开启' if show_full_request_body else '关闭'}完整请求体日志")
-    return {"show_full_request_body": show_full_request_body}
+    global show_full_response_body
+    show_full_response_body = settings.show_full_response_body
+    log_message(f"管理: 已{'开启' if show_full_response_body else '关闭'}完整响应体日志")
+    return {"show_full_response_body": show_full_response_body}
 
 
 app.include_router(admin_router)
