@@ -59,10 +59,15 @@ app = FastAPI(
 
 # --- 2. Pydantic 数据模型 ---
 
+UserAgentMode = Literal["external", "aggregator", "claude_code", "sillytavern", "custom"]
+InjectionPosition = Literal["prepend", "append"]
+
+
 class InjectedMessage(BaseModel):
     """配置项注入消息"""
     role: Literal["system", "user", "assistant", "tool"] = Field(..., description="消息角色")
     content: str = Field(..., description="消息内容")
+    position: Optional[InjectionPosition] = Field(None, description="单条消息注入位置：prepend=最前，append=最后；为空时兼容旧配置级 injection_position")
 
 
 class ApiConfigBase(BaseModel):
@@ -73,8 +78,10 @@ class ApiConfigBase(BaseModel):
     model: Optional[str] = Field(None, description="要覆盖的模型名称，如果为 null/空，则使用原始请求中的 model")
     max_retries: Optional[int] = Field(0, description="该配置项失败后的重试次数（默认 0，即不重试）")
     request_overrides: Optional[Dict[str, Any]] = Field(default_factory=dict, description="转发时强制覆盖到请求体的参数（支持任意 JSON 对象）")
-    injection_position: Optional[Literal["prepend", "append"]] = Field("prepend", description="注入消息位置：prepend=最前，append=最后")
+    injection_position: Optional[InjectionPosition] = Field("prepend", description="旧版配置级注入位置；仅用于兼容未携带 position 的注入消息")
     injected_messages: Optional[List[InjectedMessage]] = Field(default_factory=list, description="按顺序注入到 messages 的消息列表")
+    user_agent_mode: Optional[UserAgentMode] = Field("aggregator", description="User-Agent 模式：external/aggregator/claude_code/sillytavern/custom")
+    custom_user_agent: Optional[str] = Field(None, description="自定义 User-Agent，仅 user_agent_mode=custom 时使用")
     stream_mode_strategy: Optional[Literal["passthrough", "force_fake_non_stream", "force_fake_stream"]] = Field(
         "passthrough",
         description="流模式策略：passthrough=不变动，force_fake_non_stream=假非流，force_fake_stream=假流式"
@@ -99,7 +106,19 @@ class LogSettingsUpdate(BaseModel):
     show_full_response_body: bool = Field(..., description="是否在日志中显示完整响应体")
 
 
+class UpstreamModelQueryRequest(BaseModel):
+    """使用未保存的表单参数查询上游模型列表"""
+    url: str = Field(..., description="OpenAI 兼容 API 终端地址, e.g., https://api.openai.com/v1")
+    api_key: str = Field(..., description="用于该终端的 API Key")
+    user_agent_mode: Optional[UserAgentMode] = Field("aggregator", description="User-Agent 模式")
+    custom_user_agent: Optional[str] = Field(None, description="自定义 User-Agent")
+
 # --- 3. 辅助函数 (日志, JSON I/O, 统计) ---
+
+AGGREGATOR_USER_AGENT = f"{PROJECT_NAME}/{API_VERSION}"
+CLAUDE_CODE_USER_AGENT = "claude-cli/2.1.63 (external, cli)"
+SILLYTAVERN_USER_AGENT = "node-fetch"
+
 
 def log_message(message: str):
     """向内存日志队列中添加一条日志"""
@@ -347,22 +366,26 @@ async def get_models(auth: bool = Depends(verify_key)):
     }
 
 
-def normalize_injected_messages(raw_messages: Any) -> List[Dict[str, str]]:
-    """将 injected_messages 归一化为可直接发往上游的消息列表"""
+def normalize_injected_messages(raw_messages: Any, default_position: Optional[str] = "prepend") -> List[Dict[str, str]]:
+    """将 injected_messages 归一化为可直接发往上游的消息列表，并兼容旧版配置级注入位置。"""
     if not isinstance(raw_messages, list):
         return []
 
     allowed_roles = {"system", "user", "assistant", "tool"}
+    allowed_positions = {"prepend", "append"}
+    fallback_position = default_position if default_position in allowed_positions else "prepend"
     normalized: List[Dict[str, str]] = []
 
     for msg in raw_messages:
         if isinstance(msg, dict):
             role = msg.get("role")
             content = msg.get("content")
+            position = msg.get("position")
         elif hasattr(msg, "dict"):
             data = msg.dict()
             role = data.get("role")
             content = data.get("content")
+            position = data.get("position")
         else:
             continue
 
@@ -370,13 +393,50 @@ def normalize_injected_messages(raw_messages: Any) -> List[Dict[str, str]]:
             continue
         if content is None:
             continue
+        if position not in allowed_positions:
+            position = fallback_position
 
         normalized.append({
             "role": role,
-            "content": str(content)
+            "content": str(content),
+            "position": position
         })
 
     return normalized
+
+
+def split_injected_messages_by_position(raw_messages: Any, default_position: Optional[str] = "prepend") -> Dict[str, List[Dict[str, str]]]:
+    """按单条消息 position 拆分注入消息；发给上游前移除 position 元信息。"""
+    groups = {"prepend": [], "append": []}
+    for msg in normalize_injected_messages(raw_messages, default_position):
+        upstream_msg = {"role": msg["role"], "content": msg["content"]}
+        groups[msg["position"]].append(upstream_msg)
+    return groups
+
+
+def resolve_user_agent(user_agent_mode: Optional[str], custom_user_agent: Optional[str], external_user_agent: Optional[str]) -> Optional[str]:
+    """根据配置解析最终发往上游的 User-Agent。"""
+    mode = user_agent_mode or "aggregator"
+
+    if mode == "external":
+        return external_user_agent or AGGREGATOR_USER_AGENT
+    if mode == "claude_code":
+        return CLAUDE_CODE_USER_AGENT
+    if mode == "sillytavern":
+        return SILLYTAVERN_USER_AGENT
+    if mode == "custom":
+        custom_value = (custom_user_agent or "").strip()
+        return custom_value or AGGREGATOR_USER_AGENT
+
+    return AGGREGATOR_USER_AGENT
+
+
+def apply_user_agent_header(headers: Dict[str, str], user_agent_mode: Optional[str], custom_user_agent: Optional[str], external_user_agent: Optional[str]) -> Dict[str, str]:
+    """在保持现有请求头构造逻辑不变的基础上，仅追加/覆盖 User-Agent。"""
+    resolved_user_agent = resolve_user_agent(user_agent_mode, custom_user_agent, external_user_agent)
+    if resolved_user_agent:
+        headers["User-Agent"] = resolved_user_agent
+    return headers
 
 
 def extract_total_tokens(payload: Any) -> Optional[int]:
@@ -723,6 +783,12 @@ async def proxy_chat_completions(
             "Content-Type": "application/json",
             "Accept": "application/json" if not upstream_is_stream else "text/event-stream"
         }
+        apply_user_agent_header(
+            proxy_headers,
+            config.user_agent_mode,
+            config.custom_user_agent,
+            request.headers.get("user-agent")
+        )
 
         for attempt_no in range(max_retries + 1):
             response_context = None
@@ -744,18 +810,14 @@ async def proxy_chat_completions(
             if config.model:
                 proxy_body["model"] = config.model
 
-            # 注入消息（可配置最前/最后）
-            injected_messages = normalize_injected_messages(config.injected_messages)
-            if injected_messages:
+            # 注入消息（每条消息可独立配置最前/最后；兼容旧版配置级 injection_position）
+            injected_message_groups = split_injected_messages_by_position(config.injected_messages, config.injection_position)
+            if injected_message_groups["prepend"] or injected_message_groups["append"]:
                 original_messages = proxy_body.get("messages")
                 if not isinstance(original_messages, list):
                     original_messages = []
 
-                injection_position = config.injection_position or "prepend"
-                if injection_position == "append":
-                    proxy_body["messages"] = original_messages + injected_messages
-                else:
-                    proxy_body["messages"] = injected_messages + original_messages
+                proxy_body["messages"] = injected_message_groups["prepend"] + original_messages + injected_message_groups["append"]
 
             try:
                 await ensure_client_connected()
@@ -1098,6 +1160,50 @@ async def get_statistics():
 async def get_logs() -> List[str]:
     """获取最新的 200 条内存日志"""
     return list(log_deque)
+
+
+@admin_router.post("/models/query")
+async def query_upstream_models(query: UpstreamModelQueryRequest, request: Request) -> Dict[str, Any]:
+    """使用当前表单中未保存的 URL/Key/UA 模式查询上游 OpenAI 兼容模型列表。"""
+    upstream_url = f"{query.url.rstrip('/')}/models"
+    headers = {
+        "Authorization": f"Bearer {query.api_key}",
+        "Accept": "application/json"
+    }
+    apply_user_agent_header(
+        headers,
+        query.user_agent_mode,
+        query.custom_user_agent,
+        request.headers.get("user-agent")
+    )
+
+    try:
+        response = await httpx_client.get(upstream_url, headers=headers)
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text or e.response.reason_phrase
+        raise HTTPException(status_code=502, detail=f"上游模型接口返回错误 (HTTP {e.response.status_code}): {detail}")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"请求上游模型接口失败: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"解析上游模型接口响应失败: {e}")
+
+    raw_models = payload.get("data") if isinstance(payload, dict) else None
+    model_ids: List[str] = []
+    if isinstance(raw_models, list):
+        for item in raw_models:
+            if isinstance(item, dict):
+                model_id = item.get("id")
+            else:
+                model_id = None
+            if isinstance(model_id, str) and model_id.strip():
+                model_ids.append(model_id.strip())
+
+    return {
+        "object": "list",
+        "data": sorted(set(model_ids))
+    }
 
 
 @admin_router.get("/settings/logs")

@@ -415,6 +415,66 @@ td .edit-btn:hover {
     border-radius: var(--radius-lg);
 }
 
+.model-picker-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(260px, 0.45fr);
+    gap: 0.75rem;
+    align-items: stretch;
+}
+
+.model-dropdown-wrap {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 0.5rem;
+    padding: 0.35rem;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+    box-shadow: var(--shadow-sm);
+}
+
+.model-query-button {
+    white-space: nowrap;
+    padding: 0.65rem 0.95rem;
+    background: linear-gradient(135deg, var(--color-primary) 0%, #7c3aed 100%);
+    color: var(--color-white);
+    border: none;
+}
+
+.model-query-button:hover {
+    background: linear-gradient(135deg, var(--color-primary-dark) 0%, #6d28d9 100%);
+}
+
+.model-query-button:disabled,
+.model-picker-select:disabled {
+    opacity: 0.65;
+    cursor: not-allowed;
+}
+
+.model-picker-select {
+    border: none;
+    background-color: transparent;
+    padding: 0.65rem 0.5rem;
+    font-weight: 500;
+    color: var(--color-text);
+}
+
+.model-picker-select:focus {
+    box-shadow: none;
+}
+
+.model-query-status {
+    display: block;
+    margin-top: 0.45rem;
+    color: var(--color-text-light);
+}
+
+#config-custom-user-agent:disabled {
+    background-color: var(--color-secondary-light);
+    color: var(--color-text-light);
+    cursor: not-allowed;
+}
+
 .injected-messages-editor {
     display: flex;
     flex-direction: column;
@@ -424,9 +484,13 @@ td .edit-btn:hover {
 
 .injected-message-row {
     display: grid;
-    grid-template-columns: 150px 1fr auto;
+    grid-template-columns: 130px 110px 1fr auto;
     gap: 0.5rem;
     align-items: start;
+    padding: 0.75rem;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    background-color: var(--color-white);
 }
 
 .injected-message-row .injected-content-input {
@@ -453,6 +517,8 @@ td .edit-btn:hover {
     #top-bar h1 {
         font-size: 1.1rem;
     }
+    .model-picker-row,
+    .model-dropdown-wrap,
     .injected-message-row {
         grid-template-columns: 1fr;
     }

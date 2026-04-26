@@ -88,7 +88,30 @@
                             </div>
                             <div class="input-group full-span">
                                 <label for="config-model">覆盖 Model (选填)</label>
-                                <input type="text" id="config-model" placeholder="留空则使用原始请求的 model">
+                                <div class="model-picker-row">
+                                    <input type="text" id="config-model" placeholder="留空则使用原始请求的 model">
+                                    <div class="model-dropdown-wrap">
+                                        <button type="button" id="query-models-button" class="button button-secondary model-query-button">查询模型</button>
+                                        <select id="model-picker-select" class="model-picker-select">
+                                            <option value="">先查询后选择模型</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <small id="model-query-status" class="model-query-status">使用当前未保存的 URL、Key 和 UA 模式查询 OpenAI 兼容 /models。</small>
+                            </div>
+                            <div class="input-group">
+                                <label for="config-user-agent-mode">User-Agent 模式</label>
+                                <select id="config-user-agent-mode">
+                                    <option value="aggregator">使用聚合器自己的 UA</option>
+                                    <option value="external">使用外部应用传来的 UA</option>
+                                    <option value="claude_code">强制 Claude Code UA</option>
+                                    <option value="sillytavern">强制 SillyTavern UA</option>
+                                    <option value="custom">自定义 UA</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
+                                <label for="config-custom-user-agent">自定义 User-Agent</label>
+                                <input type="text" id="config-custom-user-agent" placeholder="仅自定义 UA 模式生效">
                             </div>
                             <!-- [新增] 熔断机制输入框 -->
                             <div class="input-group">
@@ -112,7 +135,7 @@
                                 </select>
                             </div>
                             <div class="input-group">
-                                <label for="config-injection-position">注入位置</label>
+                                <label for="config-injection-position">添加时默认注入位置</label>
                                 <select id="config-injection-position">
                                     <option value="prepend">最前</option>
                                     <option value="append">最后</option>
@@ -122,7 +145,7 @@
                                 <label>注入消息 (按顺序生效)</label>
                                 <div id="injected-messages-editor" class="injected-messages-editor"></div>
                                 <button type="button" id="add-injected-message-button" class="button button-secondary">+ 添加注入消息</button>
-                                <small>支持 role: system / user / assistant / tool。选择“最后 + assistant”可实现预填充效果。</small>
+                                <small>支持 role: system / user / assistant / tool。上方位置只在点击添加时固化到新消息上，每条消息可独立选择最前或最后。</small>
                             </div>
                             <div class="input-group full-span">
                                 <label for="config-request-overrides">请求参数强制覆盖 JSON (选填)</label>
