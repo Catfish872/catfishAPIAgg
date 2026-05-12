@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from endpoint_presets import (
     EndpointPresetError,
     build_images_generations_payload,
+    convert_response_base64_images_to_urls,
     normalize_image_response_urls,
     wrap_image_response_as_chat_completion,
 )
@@ -876,8 +877,13 @@ async def proxy_chat_completions(
                     response = await httpx_client.post(images_proxy_url, headers=images_headers, json=images_body)
                     response.raise_for_status()
                     response_json = response.json()
-                    response_json = normalize_image_response_urls(response_json, config.url)
                     image_public_url_prefix = str(request.base_url).rstrip("/") + GENERATED_IMAGES_ROUTE
+                    response_json = normalize_image_response_urls(response_json, config.url)
+                    response_json = convert_response_base64_images_to_urls(
+                        response_json,
+                        GENERATED_IMAGES_DIR,
+                        image_public_url_prefix
+                    )
                     wrapped_json = wrap_image_response_as_chat_completion(
                         response_json,
                         request_body,
@@ -1045,6 +1051,12 @@ async def proxy_chat_completions(
                     # 假非流：上游流式，落地后返回非流
                     stream_bytes = await response.aread()
                     merged_json = convert_sse_bytes_to_non_stream_json(stream_bytes)
+                    image_public_url_prefix = str(request.base_url).rstrip("/") + GENERATED_IMAGES_ROUTE
+                    merged_json = convert_response_base64_images_to_urls(
+                        merged_json,
+                        GENERATED_IMAGES_DIR,
+                        image_public_url_prefix
+                    )
                     total_tokens = extract_total_tokens(merged_json)
                     if show_full_response_body:
                         try:
@@ -1065,6 +1077,12 @@ async def proxy_chat_completions(
                 response = await httpx_client.post(proxy_url, headers=proxy_headers, json=proxy_body)
                 response.raise_for_status()
                 response_json = response.json()
+                image_public_url_prefix = str(request.base_url).rstrip("/") + GENERATED_IMAGES_ROUTE
+                response_json = convert_response_base64_images_to_urls(
+                    response_json,
+                    GENERATED_IMAGES_DIR,
+                    image_public_url_prefix
+                )
                 if show_full_response_body:
                     try:
                         log_message(f"响应体完整内容: {json.dumps(response_json, ensure_ascii=False)}")

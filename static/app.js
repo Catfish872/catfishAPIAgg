@@ -10,6 +10,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const topBar = document.getElementById("top-bar");
     const appContainer = document.getElementById("app-container");
     const logoutButton = document.getElementById("logout-button");
+    const effectsToggleButtons = document.querySelectorAll("[data-effects-toggle]");
 
     const tabs = document.querySelectorAll(".tab-button");
     const tabContents = document.querySelectorAll(".tab-content");
@@ -63,6 +64,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const CONFIG_COLLAPSE_STORAGE_KEY = "catfish_config_scheme_collapsed";
     const THEME_STORAGE_KEY = "catfish_console_theme";
+    const API_KEY_VISIBILITY_STORAGE_KEY = "catfish_show_api_keys";
+    const EFFECTS_STORAGE_KEY = "catfish_frontend_effects_enabled";
     const ALLOWED_THEMES = ["gpt", "gemini", "claude", "deepseek"];
     const ALLOWED_INJECT_ROLES = ["system", "user", "assistant", "tool"];
 
@@ -100,6 +103,8 @@ document.addEventListener("DOMContentLoaded", () => {
         { key: "tool_choice", type: "string", description: "工具选择策略", defaultValue: null }
     ];
 
+    let showApiKeys = localStorage.getItem(API_KEY_VISIBILITY_STORAGE_KEY) === "true";
+
     // --- 2. 核心功能函数 ---
 
     function normalizeTheme(theme) {
@@ -119,12 +124,77 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    function areEffectsEnabled() {
+        return document.documentElement.dataset.effects !== "off";
+    }
+
+    function applyEffectsPreference(enabled, shouldPersist = true) {
+        const normalized = enabled !== false;
+        document.documentElement.dataset.effects = normalized ? "on" : "off";
+        effectsToggleButtons.forEach(button => {
+            button.textContent = normalized ? "特效：开" : "特效：关";
+            button.setAttribute("aria-pressed", String(normalized));
+            button.title = normalized ? "点击关闭前端动画和高成本视觉效果" : "点击开启前端动画和视觉效果";
+        });
+        if (shouldPersist) {
+            localStorage.setItem(EFFECTS_STORAGE_KEY, normalized ? "true" : "false");
+        }
+    }
+
+    function initEffectsPreference() {
+        const savedValue = localStorage.getItem(EFFECTS_STORAGE_KEY);
+        applyEffectsPreference(savedValue !== "false", false);
+        effectsToggleButtons.forEach(button => {
+            button.addEventListener("click", () => {
+                applyEffectsPreference(!areEffectsEnabled());
+            });
+        });
+    }
+
+    function createButtonRipple(event, target) {
+        const rect = target.getBoundingClientRect();
+        const size = Math.max(rect.width, rect.height);
+        const ripple = document.createElement("span");
+        ripple.className = "button-ripple";
+        ripple.style.width = `${size}px`;
+        ripple.style.height = `${size}px`;
+        ripple.style.left = `${event.clientX - rect.left - size / 2}px`;
+        ripple.style.top = `${event.clientY - rect.top - size / 2}px`;
+        target.appendChild(ripple);
+        window.setTimeout(() => ripple.remove(), 950);
+    }
+
+    function initButtonRippleEffects() {
+        document.addEventListener("click", (event) => {
+            if (!areEffectsEnabled()) return;
+            const target = event.target.closest("button, .button");
+            if (!target || target.disabled) return;
+            createButtonRipple(event, target);
+        });
+    }
+
     function initTheme() {
         const savedTheme = normalizeTheme(localStorage.getItem(THEME_STORAGE_KEY));
         applyTheme(savedTheme, false);
         themeOptions.forEach(option => {
             option.addEventListener("click", () => applyTheme(option.dataset.themeOption));
         });
+    }
+
+    function maskApiKey(apiKey) {
+        if (!apiKey) return "";
+        if (apiKey.length <= 8) return "••••••••";
+        return `${apiKey.slice(0, 4)}••••••${apiKey.slice(-4)}`;
+    }
+
+    function formatApiKeyForDisplay(apiKey) {
+        return showApiKeys ? (apiKey || "") : maskApiKey(apiKey || "");
+    }
+
+    function setApiKeyVisibility(visible) {
+        showApiKeys = !!visible;
+        localStorage.setItem(API_KEY_VISIBILITY_STORAGE_KEY, String(showApiKeys));
+        loadConfigs();
     }
 
     async function authedFetch(url, options = {}) {
@@ -227,7 +297,7 @@ document.addEventListener("DOMContentLoaded", () => {
                             <tr data-config-id="${config.id}" data-scheme-name="${schemeName}">
                                 <td>${config.priority}</td>
                                 <td><small>${config.url}</small></td>
-                                <td><small>sk-*****${config.api_key.slice(-4)}</small></td>
+                                <td><small>${formatApiKeyForDisplay(config.api_key)}</small></td>
                                 <td>${config.model || '<em>(使用原始)</em>'}</td>
                                 <td>
                                     ${config.consecutive_failure_threshold ? `<strong>${config.consecutive_failure_threshold}次</strong> / ${config.disable_duration_seconds}s` : '<em>(未设置)</em>'}
@@ -253,9 +323,14 @@ document.addEventListener("DOMContentLoaded", () => {
                 schemeBlock.innerHTML = `
                     <div class="scheme-header">
                         <h3 class="scheme-title">${schemeName} <small>(Model Name)</small></h3>
-                        <button type="button" class="button button-secondary scheme-toggle-btn" data-scheme-name="${schemeName}">
-                            ${isCollapsed ? "展开" : "收起"}
-                        </button>
+                        <div class="scheme-header-actions">
+                            <button type="button" class="button button-secondary api-key-visibility-btn">
+                                ${showApiKeys ? "隐藏 API Key" : "显示 API Key"}
+                            </button>
+                            <button type="button" class="button button-secondary scheme-toggle-btn" data-scheme-name="${schemeName}">
+                                ${isCollapsed ? "展开" : "收起"}
+                            </button>
+                        </div>
                     </div>
                     <div class="table-container scheme-content ${isCollapsed ? "hidden" : ""}">
                         <table>
@@ -263,7 +338,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                 <tr>
                                     <th>优先级</th>
                                     <th>URL</th>
-                                    <th>Key (遮罩)</th>
+                                    <th>API Key</th>
                                     <th>覆盖 Model</th>
                                     <th>熔断设置 (失败/时长)</th>
                                     <th>重试次数</th>
@@ -281,6 +356,10 @@ document.addEventListener("DOMContentLoaded", () => {
                     </div>
                 `;
                 configSchemesContainer.appendChild(schemeBlock);
+            });
+
+            configSchemesContainer.querySelectorAll('.api-key-visibility-btn').forEach(btn => {
+                btn.addEventListener('click', () => setApiKeyVisibility(!showApiKeys));
             });
 
             configSchemesContainer.querySelectorAll('.scheme-toggle-btn').forEach(btn => {
@@ -465,7 +544,7 @@ document.addEventListener("DOMContentLoaded", () => {
         configStreamModeStrategyInput.value = config.stream_mode_strategy || "passthrough";
         renderInjectedMessagesEditor(config.injected_messages || [], config.injection_position || "prepend");
         cancelButton.classList.remove("hidden");
-        configForm.scrollIntoView({ behavior: "smooth" });
+        configForm.scrollIntoView({ behavior: areEffectsEnabled() ? "smooth" : "auto", block: "start" });
     }
 
     // [重构] 处理表单提交
@@ -816,6 +895,8 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function init() {
+        initEffectsPreference();
+        initButtonRippleEffects();
         initTheme();
         loginButton.addEventListener("click", handleLogin);
         adminKeyInput.addEventListener("keydown", (e) => {

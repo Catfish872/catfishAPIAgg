@@ -246,6 +246,69 @@ def save_base64_image_as_url(value: str, output_dir: Optional[str], public_url_p
     return f"{public_url_prefix.rstrip('/')}/{filename}"
 
 
+_INLINE_DATA_IMAGE_RE = re.compile(
+    r"data:(image/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\r\n]+)",
+    re.MULTILINE
+)
+
+
+def replace_inline_base64_images_with_urls(
+        text: str,
+        output_dir: Optional[str],
+        public_url_prefix: Optional[str]
+) -> str:
+    """替换字符串中的 data:image base64 为公开 URL，兼容 markdown 图片和裸 data URL。"""
+    if not isinstance(text, str) or "data:image/" not in text:
+        return text
+
+    def _replace(match: re.Match) -> str:
+        data_url = f"data:{match.group(1)};base64,{match.group(2)}"
+        saved_url = save_base64_image_as_url(data_url, output_dir, public_url_prefix)
+        return saved_url or match.group(0)
+
+    return _INLINE_DATA_IMAGE_RE.sub(_replace, text)
+
+
+def convert_response_base64_images_to_urls(
+        payload: Any,
+        image_output_dir: Optional[str],
+        image_public_url_prefix: Optional[str]
+) -> Any:
+    """递归处理任意 JSON 响应中的 base64 图片，把 data URL / b64_json 转为公开 URL。
+
+    该函数面向 Chat Completions、Images Generations 及第三方扩展响应格式：
+    - 字符串中的 data:image/...;base64,... 会被替换为 URL；
+    - dict 中的 b64_json 会被保存，并补充/覆盖同级 url；
+    - dict 中的 url / image_url 等字符串若是 data URL，会被替换为 URL；
+    - 保留原 b64_json 字段，避免破坏依赖原字段的调用方，但下游可优先读取 url。
+    """
+    if isinstance(payload, list):
+        for index, item in enumerate(payload):
+            payload[index] = convert_response_base64_images_to_urls(item, image_output_dir, image_public_url_prefix)
+        return payload
+
+    if isinstance(payload, dict):
+        b64_json = payload.get("b64_json")
+        if isinstance(b64_json, str) and b64_json.strip():
+            saved_url = save_base64_image_as_url(b64_json, image_output_dir, image_public_url_prefix)
+            if saved_url:
+                current_url = payload.get("url")
+                if not isinstance(current_url, str) or not current_url.strip() or current_url.startswith("data:image/"):
+                    payload["url"] = saved_url
+
+        for key, value in list(payload.items()):
+            if isinstance(value, str):
+                payload[key] = replace_inline_base64_images_with_urls(value, image_output_dir, image_public_url_prefix)
+            elif isinstance(value, (dict, list)):
+                payload[key] = convert_response_base64_images_to_urls(value, image_output_dir, image_public_url_prefix)
+        return payload
+
+    if isinstance(payload, str):
+        return replace_inline_base64_images_with_urls(payload, image_output_dir, image_public_url_prefix)
+
+    return payload
+
+
 def wrap_image_response_as_chat_completion(
         response: Dict[str, Any],
         raw_body: Dict[str, Any],
