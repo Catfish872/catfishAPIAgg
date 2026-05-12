@@ -4,28 +4,30 @@ FROM python:3.11-slim
 # 2. Set working directory
 WORKDIR /app
 
-# 3. Copy requirements
+# 3. Python runtime settings
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# 4. Copy requirements first for Docker layer cache
 COPY requirements.txt .
 
-# 4. Install dependencies
+# 5. Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. Copy static files (frontend)
-COPY static ./static
+# 6. Copy application source code
+# This includes main.py, endpoint_presets.py, static/, and other future modules.
+COPY . .
 
-# 6. Copy application code
-COPY main.py .
-
-# 7. Create and declare data volume
-# This is where config.json and stats.json will be stored
+# 7. Ensure data directory exists
+# Runtime config.json and stats.json are stored here.
 RUN mkdir -p /app/data
+
+# 8. Declare data volume
 VOLUME /app/data
 
-# 8. Expose port (will be read from $PORT env, default 8080)
-# We expose 8080 as a fallback default, but the running port
-# will be determined by the $PORT environment variable.
+# 9. Expose default port
+# The app should still read $PORT at runtime.
 EXPOSE 8080
 
-# 9. Start command
-# Run main.py directly, which will read $PORT from the environment
+# 10. Start command
 CMD ["python", "main.py"]
