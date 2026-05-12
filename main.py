@@ -15,6 +15,22 @@ from fastapi import FastAPI, Request, HTTPException, Depends, Header, APIRouter
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from endpoint_presets import (
+    EndpointPresetError,
+    build_images_generations_payload,
+    normalize_image_response_urls,
+    wrap_image_response_as_chat_completion,
+)
+from anthropic_adapter import (
+    AnthropicAdapterError,
+    OpenAIToAnthropicSSEConverter,
+    anthropic_error,
+    anthropic_to_openai_chat_request,
+    openai_chat_to_anthropic_response,
+    openai_error_to_anthropic,
+    openai_json_to_anthropic_stream,
+)
+
 # --- 1. 全局配置和初始化 ---
 
 # 项目配置
@@ -32,9 +48,13 @@ DATA_DIR = "data"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 # 统计文件路径
 STATS_FILE = os.path.join(DATA_DIR, "stats.json")
+# 生成图片文件目录与对外访问路径
+GENERATED_IMAGES_DIR = os.path.join(DATA_DIR, "generated_images")
+GENERATED_IMAGES_ROUTE = "/generated-images"
 
 # 确保数据目录存在
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(GENERATED_IMAGES_DIR, exist_ok=True)
 
 # 内存日志 (deque 是线程/异步安全的)
 log_deque = collections.deque(maxlen=200)
@@ -61,6 +81,7 @@ app = FastAPI(
 
 UserAgentMode = Literal["external", "aggregator", "claude_code", "sillytavern", "custom"]
 InjectionPosition = Literal["prepend", "append"]
+EndpointPreset = Literal["chat_completions", "images_generations"]
 
 
 class InjectedMessage(BaseModel):
@@ -85,6 +106,10 @@ class ApiConfigBase(BaseModel):
     stream_mode_strategy: Optional[Literal["passthrough", "force_fake_non_stream", "force_fake_stream"]] = Field(
         "passthrough",
         description="流模式策略：passthrough=不变动，force_fake_non_stream=假非流，force_fake_stream=假流式"
+    )
+    endpoint_preset: Optional[EndpointPreset] = Field(
+        "chat_completions",
+        description="预设端点：chat_completions=/chat/completions，images_generations=/images/generations"
     )
     # [新增] 熔断机制相关配置
     consecutive_failure_threshold: Optional[int] = Field(None, description="连续失败N次后禁用（默认不启用）")
@@ -330,6 +355,24 @@ async def verify_key(authorization: str = Header(..., description="认证密钥�
 
     if authorization != f"Bearer {ADMIN_KEY}":
         log_message(f"认证失败: 提供的 Key {authorization} 不正确")
+        raise HTTPException(status_code=401, detail="无效的认证密钥")
+    return True
+
+
+async def verify_anthropic_key(
+        authorization: Optional[str] = Header(None, description="兼容 Bearer YOUR_ADMIN_KEY"),
+        x_api_key: Optional[str] = Header(None, alias="x-api-key", description="Anthropic 风格 API Key"),
+        anthropic_version: Optional[str] = Header(None, alias="anthropic-version", description="Anthropic API 版本，仅兼容读取")
+):
+    """Anthropic 入口鉴权：同时支持 Authorization: Bearer ADMIN_KEY 与 x-api-key: ADMIN_KEY。"""
+    if not ADMIN_KEY:
+        log_message("!!! 严重错误: ADMIN_KEY 未设置, 所有请求都将失败 !!!")
+        raise HTTPException(status_code=500, detail="服务器内部错误: 认证未配置")
+
+    bearer_ok = authorization == f"Bearer {ADMIN_KEY}"
+    x_key_ok = x_api_key == ADMIN_KEY
+    if not bearer_ok and not x_key_ok:
+        log_message("Anthropic 入口认证失败: Authorization/x-api-key 均不匹配")
         raise HTTPException(status_code=401, detail="无效的认证密钥")
     return True
 
@@ -822,6 +865,71 @@ async def proxy_chat_completions(
             try:
                 await ensure_client_connected()
 
+                if config.endpoint_preset == "images_generations":
+                    images_proxy_url = f"{config.url.rstrip('/')}/images/generations"
+                    images_headers = dict(proxy_headers)
+                    images_headers["Accept"] = "application/json"
+                    if request_body.get("stream", False):
+                        log_message(f"配置项 ID: {config.id} 使用 images_generations 预设，上游按非流式请求，向下游返回 fake SSE 图片 markdown")
+
+                    images_body = build_images_generations_payload(proxy_body, config)
+                    response = await httpx_client.post(images_proxy_url, headers=images_headers, json=images_body)
+                    response.raise_for_status()
+                    response_json = response.json()
+                    response_json = normalize_image_response_urls(response_json, config.url)
+                    image_public_url_prefix = str(request.base_url).rstrip("/") + GENERATED_IMAGES_ROUTE
+                    wrapped_json = wrap_image_response_as_chat_completion(
+                        response_json,
+                        request_body,
+                        config,
+                        image_output_dir=GENERATED_IMAGES_DIR,
+                        image_public_url_prefix=image_public_url_prefix
+                    )
+
+                    if show_full_response_body:
+                        try:
+                            log_message(f"响应体完整内容: {json.dumps(wrapped_json, ensure_ascii=False)}")
+                        except Exception:
+                            log_message(f"响应体完整内容(序列化失败，使用字符串): {str(wrapped_json)}")
+
+                    log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次 Images Generations 预设请求成功")
+                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+
+                    if request_body.get("stream", False):
+                        async def images_fake_stream_generator(final_payload: Dict[str, Any]):
+                            content = ""
+                            try:
+                                content = final_payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+                            except Exception:
+                                content = ""
+                            chunk_payload = {
+                                "id": final_payload.get("id"),
+                                "object": "chat.completion.chunk",
+                                "created": final_payload.get("created"),
+                                "model": final_payload.get("model"),
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"role": "assistant", "content": content},
+                                        "finish_reason": None
+                                    }
+                                ]
+                            }
+                            yield f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n".encode("utf-8")
+                            done_payload = {
+                                "id": final_payload.get("id"),
+                                "object": "chat.completion.chunk",
+                                "created": final_payload.get("created"),
+                                "model": final_payload.get("model"),
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                            }
+                            yield f"data: {json.dumps(done_payload, ensure_ascii=False)}\n\n".encode("utf-8")
+                            yield b"data: [DONE]\n\n"
+
+                        return StreamingResponse(images_fake_stream_generator(wrapped_json), media_type="text/event-stream")
+
+                    return JSONResponse(content=wrapped_json, status_code=response.status_code)
+
                 # 策略强制覆盖 stream，确保上游请求模式与策略一致
                 proxy_body["stream"] = upstream_is_stream
 
@@ -909,11 +1017,9 @@ async def proxy_chat_completions(
                                     try_extract_usage_from_sse_line(pending.decode("utf-8", errors="ignore"))
 
                                 if total_tokens is not None:
-                                    log_message(f"配置项 ID: {successful_config.id} 流式请求成功 (流结束, total_tokens={total_tokens}, 策略={mode_plan['mode_label']})")
+                                    log_message(f"配置项 ID: {successful_config.id} 流式请求结束 (total_tokens={total_tokens}, 策略={mode_plan['mode_label']}，成功统计已在启动时记录)")
                                 else:
-                                    log_message(f"配置项 ID: {successful_config.id} 流式请求成功 (流结束, total_tokens=未知, 策略={mode_plan['mode_label']})")
-                                await update_stats_and_state(successful_config, True, scheme_name, original_group,
-                                                             success_index_in_group)
+                                    log_message(f"配置项 ID: {successful_config.id} 流式请求结束 (total_tokens=未知, 策略={mode_plan['mode_label']}，成功统计已在启动时记录)")
                             except Exception as e:
                                 error_type = type(e).__name__
                                 if "ClientDisconnect" in error_type or "CancelledError" in error_type:
@@ -927,7 +1033,8 @@ async def proxy_chat_completions(
                                 await ctx.__aexit__(None, None, None)
 
                         log_message(
-                            f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次流式请求启动成功 (HTTP {response.status_code}, 策略={mode_plan['mode_label']})")
+                            f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次流式请求启动成功 (HTTP {response.status_code}, 策略={mode_plan['mode_label']}，立即记录成功并推进轮询)")
+                        await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                         response_context_to_pass = response_context
                         response_context = None
                         return StreamingResponse(
@@ -991,6 +1098,44 @@ async def proxy_chat_completions(
             except asyncio.CancelledError:
                 log_message("当前代理请求已被取消，停止继续重试且不计入后端失败")
                 raise
+            except EndpointPresetError as e:
+                last_error = e
+                error_content = {
+                    "error": {
+                        "message": str(e),
+                        "type": "invalid_request_error",
+                        "code": "images_generations_preset_error"
+                    }
+                }
+
+                class PresetErrorResponse:
+                    def __init__(self, content, status_code_val):
+                        self._content, self.status_code = content, status_code_val
+
+                    def json(self):
+                        return self._content
+
+                    @property
+                    def text(self):
+                        return json.dumps(self._content, ensure_ascii=False)
+
+                last_error_response = PresetErrorResponse(error_content, 400)
+                log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (Images Generations 预设错误): {e}")
+                try:
+                    await ensure_client_connected()
+                except ClientRequestAborted as disconnect_error:
+                    log_message(f"上游客户端已断开，本次下游失败不计入统计且停止重试: {disconnect_error}")
+                    return Response(status_code=499)
+                await update_stats_and_state(config, False, scheme_name, [], 0)
+                if attempt_no < max_retries:
+                    try:
+                        await ensure_client_connected()
+                    except ClientRequestAborted as disconnect_error:
+                        log_message(f"上游客户端已断开，取消后续重试: {disconnect_error}")
+                        return Response(status_code=499)
+                    log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
+                    continue
+                break
             except httpx.HTTPStatusError as e:
                 last_error, last_error_response = e, e.response
                 log_message(
@@ -1068,6 +1213,98 @@ async def proxy_chat_completions(
         return JSONResponse(content=error_content, status_code=last_error_response.status_code)
 
     return JSONResponse(status_code=500, content={"error": f"所有后端均失败。最后错误: {str(last_error)}"})
+
+
+@app.post("/v1/messages", tags=["Proxy"])
+async def proxy_anthropic_messages(
+        request: Request,
+        auth: bool = Depends(verify_anthropic_key)
+):
+    """Anthropic Messages 兼容入口。内部转换为 OpenAI chat.completions 请求并复用现有聚合代理逻辑。"""
+    try:
+        anthropic_body = await request.json()
+    except Exception:
+        log_message("Anthropic 请求体 JSON 解析失败")
+        return JSONResponse(status_code=400, content=anthropic_error("无效的 JSON 请求体"))
+
+    try:
+        openai_body = anthropic_to_openai_chat_request(anthropic_body)
+    except AnthropicAdapterError as e:
+        log_message(f"Anthropic 请求转换失败: {e}")
+        return JSONResponse(status_code=400, content=anthropic_error(str(e)))
+
+    requested_stream = bool(anthropic_body.get("stream", False))
+
+    class InternalOpenAIRequest:
+        """最小 Request 适配器，用于复用现有 OpenAI 代理主流程。"""
+        def __init__(self, body: Dict[str, Any], original_request: Request):
+            self._body = body
+            self.headers = original_request.headers
+            self._original_request = original_request
+
+        async def json(self):
+            return self._body
+
+        async def is_disconnected(self):
+            return await self._original_request.is_disconnected()
+
+    internal_request = InternalOpenAIRequest(openai_body, request)
+    openai_response = await proxy_chat_completions(internal_request, True)
+
+    if isinstance(openai_response, StreamingResponse):
+        if not requested_stream:
+            # 正常情况下 Anthropic 非流式请求会让内部 OpenAI body stream=false，不应走到这里；保底返回协议错误。
+            log_message("Anthropic 非流式请求收到了内部流式响应，返回协议错误")
+            return JSONResponse(status_code=500, content=anthropic_error("内部代理返回了非预期的流式响应", "api_error"))
+
+        async def anthropic_sse_generator():
+            pending = bytearray()
+            converter = OpenAIToAnthropicSSEConverter(anthropic_body)
+            for event_bytes in converter.start_events():
+                yield event_bytes
+            async for chunk in openai_response.body_iterator:
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                pending.extend(chunk)
+                while b"\n" in pending:
+                    line_bytes, _, rest = pending.partition(b"\n")
+                    pending = bytearray(rest)
+                    line_text = line_bytes.decode("utf-8", errors="ignore")
+                    for event_bytes in converter.feed_line(line_text):
+                        yield event_bytes
+            if pending:
+                line_text = pending.decode("utf-8", errors="ignore")
+                for event_bytes in converter.feed_line(line_text):
+                    yield event_bytes
+            for event_bytes in converter.finish_events():
+                yield event_bytes
+
+        return StreamingResponse(anthropic_sse_generator(), media_type="text/event-stream")
+
+    body_bytes = getattr(openai_response, "body", b"")
+    status_code = getattr(openai_response, "status_code", 200)
+    try:
+        openai_payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+    except Exception:
+        openai_payload = body_bytes.decode("utf-8", errors="ignore") if isinstance(body_bytes, (bytes, bytearray)) else str(body_bytes)
+
+    if status_code >= 400:
+        error_payload, error_status = openai_error_to_anthropic(openai_payload, status_code)
+        return JSONResponse(status_code=error_status, content=error_payload)
+
+    try:
+        if requested_stream:
+            async def json_to_anthropic_sse_generator():
+                for event_bytes in openai_json_to_anthropic_stream(openai_payload, anthropic_body):
+                    yield event_bytes
+
+            return StreamingResponse(json_to_anthropic_sse_generator(), media_type="text/event-stream")
+
+        anthropic_payload = openai_chat_to_anthropic_response(openai_payload, anthropic_body)
+        return JSONResponse(status_code=status_code, content=anthropic_payload)
+    except Exception as e:
+        log_message(f"Anthropic 响应转换失败: {e}")
+        return JSONResponse(status_code=500, content=anthropic_error(f"响应转换失败: {e}", "api_error"))
 
 
 # --- 6. 管理 API (带认证) ---
@@ -1250,9 +1487,10 @@ async def shutdown_event():
     log_message(f"{PROJECT_NAME} 正在关闭")
 
 
-# --- 8. 静态文件服务 (用于前端) ---
+# --- 8. 静态文件服务 (用于前端和生成图片) ---
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount(GENERATED_IMAGES_ROUTE, StaticFiles(directory=GENERATED_IMAGES_DIR), name="generated_images")
 
 
 @app.get("/", tags=["Frontend"])

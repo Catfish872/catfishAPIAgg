@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="gpt">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -10,14 +10,23 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+    <div class="theme-backdrop" aria-hidden="true">
+        <div class="backdrop-grid"></div>
+        <div class="backdrop-orb orb-one"></div>
+        <div class="backdrop-orb orb-two"></div>
+        <div class="backdrop-orb orb-three"></div>
+        <div class="backdrop-scan"></div>
+    </div>
 
-    <!-- 
+    <!--
       登录遮罩
     -->
     <div id="login-overlay">
         <div class="login-box card">
+            <div class="brand-mark" aria-hidden="true">CF</div>
+            <p class="eyebrow">Model Gateway Console</p>
             <h2>catfishAPIAgg</h2>
-            <p>管理员登录</p>
+            <p>统一聚合 OpenAI / Anthropic / Images 上游，按主题进入你的模型控制台。</p>
             <div class="input-group">
                 <input type="password" id="admin-key-input" placeholder="请输入管理员密钥">
             </div>
@@ -31,8 +40,22 @@
     -->
     <header id="top-bar" class="hidden">
         <div class="header-content">
-            <h1>catfishAPIAgg - 面板</h1>
-            <button id="logout-button" class="button button-secondary">退出登录</button>
+            <div class="header-brand">
+                <span class="brand-mark small" aria-hidden="true">CF</span>
+                <div>
+                    <p class="eyebrow">API Aggregation Panel</p>
+                    <h1>catfishAPIAgg</h1>
+                </div>
+            </div>
+            <div class="header-actions">
+                <div class="theme-switcher" role="group" aria-label="选择界面主题">
+                    <button type="button" class="theme-option active" data-theme-option="gpt">GPT</button>
+                    <button type="button" class="theme-option" data-theme-option="gemini">Gemini</button>
+                    <button type="button" class="theme-option" data-theme-option="claude">Claude</button>
+                    <button type="button" class="theme-option" data-theme-option="deepseek">DeepSeek</button>
+                </div>
+                <button id="logout-button" class="button button-secondary">退出登录</button>
+            </div>
         </div>
     </header>
 
@@ -42,6 +65,19 @@
     <div id="app-container" class="hidden">
         
         <main>
+            <section class="hero-panel card">
+                <div>
+                    <p class="eyebrow">Adaptive Model Gateway</p>
+                    <h2>模型聚合控制台</h2>
+                    <p>用不同模型的视觉语言管理上游配置、轮询状态、端点预设和实时日志。</p>
+                </div>
+                <div class="hero-metrics" aria-hidden="true">
+                    <span>OpenAI</span>
+                    <span>Anthropic</span>
+                    <span>Images</span>
+                </div>
+            </section>
+
             <!-- 选项卡导航 -->
             <nav class="tabs card">
                 <button class="tab-button active" data-tab="config">API 配置</button>
@@ -56,6 +92,9 @@
             <!-- 1. API 配置 -->
             <section id="config-tab" class="tab-content card active">
                 <h2>API 配置项</h2>
+                <p class="endpoint-help-text">
+                    同一个方案名称既可通过 OpenAI 兼容入口 <code>/v1/chat/completions</code> 调用，也可通过 Anthropic Messages 兼容入口 <code>/v1/messages</code> 调用。Anthropic 入口支持 <code>x-api-key</code> 或 <code>Authorization: Bearer</code> 使用同一管理员密钥。
+                </p>
                 <!-- [重构] 配置项将按方案动态生成到这里 -->
                 <div id="config-schemes-container">
                     <p>加载中...</p>
@@ -98,6 +137,17 @@
                                     </div>
                                 </div>
                                 <small id="model-query-status" class="model-query-status">使用当前未保存的 URL、Key 和 UA 模式查询 OpenAI 兼容 /models。</small>
+                            </div>
+                            <div class="input-group full-span endpoint-preset-group">
+                                <label for="config-endpoint-preset">预设端点</label>
+                                <select id="config-endpoint-preset">
+                                    <option value="chat_completions">Chat Completions (/chat/completions)</option>
+                                    <option value="images_generations">Images Generations (/images/generations)</option>
+                                </select>
+                                <small>
+                                    Chat Completions：默认聊天端点，保持原行为。<br>
+                                    Images Generations：将 chat messages 自动合成为 prompt，并请求上游 /images/generations。适合接入图片生成接口；若消息中包含 image_url，会自动转换为 reference_images。
+                                </small>
                             </div>
                             <div class="input-group">
                                 <label for="config-user-agent-mode">User-Agent 模式</label>

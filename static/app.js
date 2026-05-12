@@ -13,6 +13,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const tabs = document.querySelectorAll(".tab-button");
     const tabContents = document.querySelectorAll(".tab-content");
+    const themeOptions = document.querySelectorAll(".theme-option");
 
     // 配置 Tab
     const configSchemesContainer = document.getElementById("config-schemes-container");
@@ -27,6 +28,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const queryModelsButton = document.getElementById("query-models-button");
     const modelPickerSelect = document.getElementById("model-picker-select");
     const modelQueryStatus = document.getElementById("model-query-status");
+    const configEndpointPresetInput = document.getElementById("config-endpoint-preset");
     const configUserAgentModeInput = document.getElementById("config-user-agent-mode");
     const configCustomUserAgentInput = document.getElementById("config-custom-user-agent");
     const configFailureThresholdInput = document.getElementById("config-failure-threshold");
@@ -60,6 +62,8 @@ document.addEventListener("DOMContentLoaded", () => {
     let isSyncingLogToggle = false;
 
     const CONFIG_COLLAPSE_STORAGE_KEY = "catfish_config_scheme_collapsed";
+    const THEME_STORAGE_KEY = "catfish_console_theme";
+    const ALLOWED_THEMES = ["gpt", "gemini", "claude", "deepseek"];
     const ALLOWED_INJECT_ROLES = ["system", "user", "assistant", "tool"];
 
     const INJECTION_POSITION_LABEL_MAP = {
@@ -97,6 +101,31 @@ document.addEventListener("DOMContentLoaded", () => {
     ];
 
     // --- 2. 核心功能函数 ---
+
+    function normalizeTheme(theme) {
+        return ALLOWED_THEMES.includes(theme) ? theme : "gpt";
+    }
+
+    function applyTheme(theme, shouldPersist = true) {
+        const normalized = normalizeTheme(theme);
+        document.documentElement.dataset.theme = normalized;
+        themeOptions.forEach(option => {
+            const isActive = option.dataset.themeOption === normalized;
+            option.classList.toggle("active", isActive);
+            option.setAttribute("aria-pressed", String(isActive));
+        });
+        if (shouldPersist) {
+            localStorage.setItem(THEME_STORAGE_KEY, normalized);
+        }
+    }
+
+    function initTheme() {
+        const savedTheme = normalizeTheme(localStorage.getItem(THEME_STORAGE_KEY));
+        applyTheme(savedTheme, false);
+        themeOptions.forEach(option => {
+            option.addEventListener("click", () => applyTheme(option.dataset.themeOption));
+        });
+    }
 
     async function authedFetch(url, options = {}) {
         if (!adminKey) {
@@ -205,6 +234,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                 </td>
                                 <td>${config.max_retries ?? 0}</td>
                                 <td><small>${formatStreamModeStrategy(config.stream_mode_strategy)}</small></td>
+                                <td><small>${formatEndpointPreset(config.endpoint_preset)}</small></td>
                                 <td><small>${formatUserAgentMode(config)}</small></td>
                                 <td><small>${formatInjectionSummary(config)}</small></td>
                                 <td><small>${formatOverridesSummary(config.request_overrides)}</small></td>
@@ -217,7 +247,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         `;
                     });
                 } else {
-                    tableRows = `<tr><td colspan="12">该方案下没有配置项</td></tr>`;
+                    tableRows = `<tr><td colspan="13">该方案下没有配置项</td></tr>`;
                 }
 
                 schemeBlock.innerHTML = `
@@ -238,6 +268,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                     <th>熔断设置 (失败/时长)</th>
                                     <th>重试次数</th>
                                     <th>流模式策略</th>
+                                    <th>预设端点</th>
                                     <th>UA 模式</th>
                                     <th>注入策略</th>
                                     <th>强制覆盖参数</th>
@@ -400,6 +431,7 @@ document.addEventListener("DOMContentLoaded", () => {
         configSchemeInput.disabled = false;
         configMaxRetriesInput.value = "0";
         configInjectionPositionInput.value = "prepend";
+        configEndpointPresetInput.value = "chat_completions";
         configUserAgentModeInput.value = "aggregator";
         configCustomUserAgentInput.value = "";
         updateCustomUserAgentVisibility();
@@ -425,6 +457,7 @@ document.addEventListener("DOMContentLoaded", () => {
         configMaxRetriesInput.value = config.max_retries ?? 0;
         configRequestOverridesInput.value = JSON.stringify(config.request_overrides || {}, null, 2);
         configInjectionPositionInput.value = config.injection_position || "prepend";
+        configEndpointPresetInput.value = config.endpoint_preset || "chat_completions";
         configUserAgentModeInput.value = config.user_agent_mode || "aggregator";
         configCustomUserAgentInput.value = config.custom_user_agent || "";
         updateCustomUserAgentVisibility();
@@ -469,6 +502,7 @@ document.addEventListener("DOMContentLoaded", () => {
             max_retries: maxRetries,
             request_overrides: requestOverrides,
             injection_position: configInjectionPositionInput.value || "prepend",
+            endpoint_preset: configEndpointPresetInput.value || "chat_completions",
             user_agent_mode: configUserAgentModeInput.value || "aggregator",
             custom_user_agent: configCustomUserAgentInput.value || null,
             stream_mode_strategy: configStreamModeStrategyInput.value || "passthrough",
@@ -607,6 +641,12 @@ document.addEventListener("DOMContentLoaded", () => {
     function formatStreamModeStrategy(strategy) {
         const normalized = strategy || "passthrough";
         return STREAM_STRATEGY_LABEL_MAP[normalized] || normalized;
+    }
+
+    function formatEndpointPreset(preset) {
+        const normalized = preset || "chat_completions";
+        if (normalized === "images_generations") return "Images Generations (/images/generations)";
+        return "Chat Completions (/chat/completions)";
     }
 
     function formatInjectionSummary(config) {
@@ -776,6 +816,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function init() {
+        initTheme();
         loginButton.addEventListener("click", handleLogin);
         adminKeyInput.addEventListener("keydown", (e) => {
             if (e.key === "Enter") handleLogin();
