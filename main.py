@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Dict, Literal
 from itertools import groupby
+from urllib.parse import urljoin
 
 from fastapi import FastAPI, Request, HTTPException, Depends, Header, APIRouter
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
@@ -17,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from endpoint_presets import (
     EndpointPresetError,
-    build_images_generations_payload,
+    build_images_request_plan,
     convert_response_base64_images_to_urls,
     normalize_image_response_urls,
     wrap_image_response_as_chat_completion,
@@ -83,6 +84,14 @@ app = FastAPI(
 UserAgentMode = Literal["external", "aggregator", "claude_code", "sillytavern", "custom"]
 InjectionPosition = Literal["prepend", "append"]
 EndpointPreset = Literal["chat_completions", "images_generations"]
+ImageUpstreamMode = Literal[
+    "openai_edit_image",
+    "generation_images_array",
+    "generation_ref_assets_array",
+    "generation_reference_images_array",
+    "custom"
+]
+ImageCustomReferenceMode = Literal["single", "array"]
 
 
 class InjectedMessage(BaseModel):
@@ -112,6 +121,19 @@ class ApiConfigBase(BaseModel):
         "chat_completions",
         description="预设端点：chat_completions=/chat/completions，images_generations=/images/generations"
     )
+    image_upstream_mode: Optional[ImageUpstreamMode] = Field(
+        "generation_reference_images_array",
+        description="图片上游模式：openai_edit_image=有图走 edits；generation_* 在 generations 端点用不同字段承载参考图；custom=自定义"
+    )
+    image_generation_path: Optional[str] = Field("/images/generations", description="图片文生图路径，默认 /images/generations")
+    image_edit_path: Optional[str] = Field("/images/edits", description="图片图生图/编辑路径，默认 /images/edits")
+    image_custom_generation_path: Optional[str] = Field(None, description="自定义图片无图路径；为空使用 image_generation_path")
+    image_custom_edit_path: Optional[str] = Field(None, description="自定义图片有图路径；为空使用 image_edit_path")
+    image_custom_reference_field: Optional[str] = Field(None, description="自定义参考图字段名")
+    image_custom_reference_mode: Optional[ImageCustomReferenceMode] = Field("array", description="自定义参考图字段模式：single=第一张字符串，array=全部数组")
+    image_custom_include_reference_when_empty: Optional[bool] = Field(False, description="无参考图时是否仍发送自定义空参考图字段")
+    image_task_poll_timeout_seconds: Optional[int] = Field(300, description="图片 202 异步任务最大等待秒数，默认 300 秒")
+    image_task_poll_interval_seconds: Optional[float] = Field(2.0, description="图片 202 异步任务轮询间隔秒数，默认 2 秒")
     # [新增] 熔断机制相关配置
     consecutive_failure_threshold: Optional[int] = Field(None, description="连续失败N次后禁用（默认不启用）")
     disable_duration_seconds: Optional[int] = Field(None, description="禁用时长（秒，默认不启用）")
@@ -261,7 +283,8 @@ async def update_stats_and_state(
         is_success: bool,
         scheme_name: str,
         priority_group: List[ApiConfig],
-        success_index_in_group: int
+        success_index_in_group: int,
+        advance_round_robin: bool = True
 ):
     """
     [修复] 更新统计数据、熔断状态和轮询状态 (无死锁版本)
@@ -329,8 +352,8 @@ async def update_stats_and_state(
                 log_message(
                     f"熔断触发: 配置项 ID {config.id} 已被禁用，直到 {disabled_until_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # --- 5. 仅在成功时更新轮询状态 ---
-        if is_success:
+        # --- 5. 仅在成功且允许时更新配置项轮询状态 ---
+        if is_success and advance_round_robin:
             if "round_robin_state" not in stats: stats["round_robin_state"] = {}
             if scheme_name not in stats["round_robin_state"]:
                 stats["round_robin_state"][scheme_name] = {}
@@ -344,6 +367,44 @@ async def update_stats_and_state(
                 await f.write(json.dumps(stats, indent=2, ensure_ascii=False))
         except Exception as e:
             log_message(f"在 update_stats_and_state 中写入 {STATS_FILE} 失败: {e}")
+
+
+async def advance_round_robin_state_only(
+        config: ApiConfig,
+        scheme_name: str,
+        priority_group: List[ApiConfig],
+        success_index_in_group: int
+):
+    """仅推进配置项 round-robin 指针，不记录成功/失败，不影响熔断。用于图片 202 任务已被上游接收。"""
+    async with file_lock:
+        default_data = get_default_stats()
+        stats = default_data
+        try:
+            if os.path.exists(STATS_FILE):
+                async with aiofiles.open(STATS_FILE, 'r', encoding='utf-8') as f:
+                    content = await f.read()
+                    if content:
+                        stats = json.loads(content)
+            else:
+                async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
+                    await f.write(json.dumps(default_data, indent=2))
+        except Exception as e:
+            log_message(f"在 advance_round_robin_state_only 中读/创建 {STATS_FILE} 失败: {e}. 使用默认值。")
+            stats = default_data
+
+        if "round_robin_state" not in stats:
+            stats["round_robin_state"] = {}
+        if scheme_name not in stats["round_robin_state"]:
+            stats["round_robin_state"][scheme_name] = {}
+
+        next_index = (success_index_in_group + 1) % len(priority_group) if priority_group else 0
+        stats["round_robin_state"][scheme_name][str(config.priority)] = next_index
+
+        try:
+            async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(stats, indent=2, ensure_ascii=False))
+        except Exception as e:
+            log_message(f"在 advance_round_robin_state_only 中写入 {STATS_FILE} 失败: {e}")
 
 
 # --- 4. 认证依赖 ---
@@ -591,6 +652,163 @@ def resolve_stream_modes(external_is_stream: bool, strategy: Optional[str]) -> D
         "downstream_is_stream": external_is_stream,
         "mode_label": "不变动"
     }
+
+
+def _nested_get(obj: Any, path: List[str]) -> Any:
+    current = obj
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def extract_image_task_id(payload: Any) -> Optional[str]:
+    """从常见 202 任务壳中提取 task id。"""
+    if not isinstance(payload, dict):
+        return None
+    candidates = [
+        payload.get("task_id"),
+        payload.get("id"),
+        _nested_get(payload, ["task", "id"]),
+        _nested_get(payload, ["data", "task_id"]),
+        _nested_get(payload, ["data", "id"]),
+    ]
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def extract_image_task_status(payload: Any) -> Optional[str]:
+    """从常见任务壳中提取状态。"""
+    if not isinstance(payload, dict):
+        return None
+    candidates = [
+        payload.get("status"),
+        payload.get("state"),
+        _nested_get(payload, ["task", "status"]),
+        _nested_get(payload, ["task", "state"]),
+        _nested_get(payload, ["data", "status"]),
+        _nested_get(payload, ["data", "state"]),
+    ]
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return None
+
+
+def image_response_has_data(payload: Any) -> bool:
+    """判断是否是可包装的图片最终响应。"""
+    if not isinstance(payload, dict):
+        return False
+    data = payload.get("data")
+    if not isinstance(data, list) or not data:
+        return False
+    for item in data:
+        if isinstance(item, dict):
+            if isinstance(item.get("url"), str) and item.get("url").strip():
+                return True
+            if isinstance(item.get("b64_json"), str) and item.get("b64_json").strip():
+                return True
+    return False
+
+
+def extract_image_task_poll_url(payload: Any, upstream_base_url: str, request_path: str, task_id: str) -> str:
+    """从响应自描述 URL 或当前图片路径推导任务查询 URL。"""
+    if isinstance(payload, dict):
+        for key in ["poll_url", "status_url", "task_url"]:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                raw = value.strip()
+                if raw.startswith("http://") or raw.startswith("https://"):
+                    return raw
+                return urljoin(upstream_base_url.rstrip("/") + "/", raw.lstrip("/"))
+
+    normalized_path = "/" + str(request_path or "").strip().strip("/")
+    if normalized_path.endswith("/images/generations") or normalized_path.endswith("/images/edits"):
+        poll_path = f"/images/generations/{task_id}"
+    else:
+        poll_path = f"{normalized_path.rstrip('/')}/{task_id}"
+    return f"{upstream_base_url.rstrip('/')}{poll_path}"
+
+
+async def resolve_images_response_with_auto_poll(
+        initial_response: httpx.Response,
+        upstream_base_url: str,
+        request_path: str,
+        headers: Dict[str, str],
+        config: ApiConfig,
+        ensure_client_connected,
+        on_task_accepted=None
+) -> Dict[str, Any]:
+    """处理图片响应：同步 data 直返；HTTP 202 + task_id 自动轮询同一上游任务。"""
+    try:
+        payload = initial_response.json()
+    except Exception as e:
+        raise EndpointPresetError(f"上游 images 响应不是有效 JSON: {e}")
+
+    if image_response_has_data(payload):
+        return payload
+
+    if initial_response.status_code != 202:
+        raise EndpointPresetError("上游 images 响应缺少 data 数组")
+
+    task_id = extract_image_task_id(payload)
+    if not task_id:
+        raise EndpointPresetError("上游 images 返回 202 但缺少 task_id/id")
+
+    poll_url = extract_image_task_poll_url(payload, upstream_base_url, request_path, task_id)
+    timeout_seconds = config.image_task_poll_timeout_seconds if config.image_task_poll_timeout_seconds is not None else 300
+    interval_seconds = config.image_task_poll_interval_seconds if config.image_task_poll_interval_seconds is not None else 2.0
+    try:
+        timeout_seconds = max(1, int(timeout_seconds))
+    except Exception:
+        timeout_seconds = 300
+    try:
+        interval_seconds = max(0.5, float(interval_seconds))
+    except Exception:
+        interval_seconds = 2.0
+
+    if on_task_accepted:
+        await on_task_accepted(task_id, poll_url)
+
+    waiting_statuses = {"queued", "pending", "running", "processing", "in_progress", "created", "accepted"}
+    failure_statuses = {"failed", "failure", "error", "cancelled", "canceled", "refunded", "expired"}
+
+    deadline = datetime.now() + timedelta(seconds=timeout_seconds)
+    poll_count = 0
+    last_payload: Any = payload
+    while datetime.now() < deadline:
+        await ensure_client_connected()
+        await asyncio.sleep(interval_seconds)
+        await ensure_client_connected()
+        poll_count += 1
+
+        response = await httpx_client.get(poll_url, headers=headers)
+        if response.status_code >= 400:
+            raise EndpointPresetError(f"图片任务 {task_id} 查询失败 (HTTP {response.status_code}): {response.text}")
+        try:
+            current_payload = response.json()
+        except Exception as e:
+            raise EndpointPresetError(f"图片任务 {task_id} 查询响应不是有效 JSON: {e}")
+        last_payload = current_payload
+
+        if image_response_has_data(current_payload):
+            log_message(f"图片任务 {task_id} 第 {poll_count} 次查询获得最终 data")
+            return current_payload
+
+        status = extract_image_task_status(current_payload)
+        if status in failure_statuses:
+            raise EndpointPresetError(f"图片任务 {task_id} 状态失败: {status}")
+        if status and status not in waiting_statuses:
+            log_message(f"图片任务 {task_id} 返回未知状态 '{status}'，继续等待直到超时")
+
+    try:
+        excerpt = json.dumps(last_payload, ensure_ascii=False)[:500]
+    except Exception:
+        excerpt = str(last_payload)[:500]
+    raise EndpointPresetError(f"图片任务 {task_id} 等待超时 ({timeout_seconds}s)，最后响应: {excerpt}")
 
 
 def convert_sse_bytes_to_non_stream_json(sse_bytes: bytes) -> Dict[str, Any]:
@@ -867,16 +1085,34 @@ async def proxy_chat_completions(
                 await ensure_client_connected()
 
                 if config.endpoint_preset == "images_generations":
-                    images_proxy_url = f"{config.url.rstrip('/')}/images/generations"
+                    images_path, images_body = build_images_request_plan(proxy_body, config)
+                    images_proxy_url = f"{config.url.rstrip('/')}{images_path}"
                     images_headers = dict(proxy_headers)
                     images_headers["Accept"] = "application/json"
                     if request_body.get("stream", False):
                         log_message(f"配置项 ID: {config.id} 使用 images_generations 预设，上游按非流式请求，向下游返回 fake SSE 图片 markdown")
 
-                    images_body = build_images_generations_payload(proxy_body, config)
                     response = await httpx_client.post(images_proxy_url, headers=images_headers, json=images_body)
                     response.raise_for_status()
-                    response_json = response.json()
+                    image_task_accepted = False
+
+                    async def on_image_task_accepted(task_id: str, poll_url: str):
+                        nonlocal image_task_accepted
+                        if image_task_accepted:
+                            return
+                        image_task_accepted = True
+                        log_message(f"配置项 ID: {config.id} Images 任务已被上游接受 (task_id={task_id})，提前推进配置项轮询，查询地址: {poll_url}")
+                        await advance_round_robin_state_only(config, scheme_name, original_group, success_index_in_group)
+
+                    response_json = await resolve_images_response_with_auto_poll(
+                        response,
+                        config.url.rstrip('/'),
+                        images_path,
+                        images_headers,
+                        config,
+                        ensure_client_connected,
+                        on_task_accepted=on_image_task_accepted
+                    )
                     image_public_url_prefix = str(request.base_url).rstrip("/") + GENERATED_IMAGES_ROUTE
                     response_json = normalize_image_response_urls(response_json, config.url)
                     response_json = convert_response_base64_images_to_urls(
@@ -898,8 +1134,15 @@ async def proxy_chat_completions(
                         except Exception:
                             log_message(f"响应体完整内容(序列化失败，使用字符串): {str(wrapped_json)}")
 
-                    log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次 Images Generations 预设请求成功")
-                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                    log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次 Images 预设请求成功 (path={images_path})")
+                    await update_stats_and_state(
+                        config,
+                        True,
+                        scheme_name,
+                        original_group,
+                        success_index_in_group,
+                        advance_round_robin=not image_task_accepted
+                    )
 
                     if request_body.get("stream", False):
                         async def images_fake_stream_generator(final_payload: Dict[str, Any]):
@@ -1091,9 +1334,49 @@ async def proxy_chat_completions(
                 total_tokens = extract_total_tokens(response_json)
 
                 if downstream_is_stream:
-                    # 假流式：上游非流，返回单条完整 data + [DONE]
+                    # 假流式：上游非流，转换为标准 chat.completion.chunk + [DONE]
                     async def fake_stream_generator(final_payload: Dict[str, Any]):
-                        yield f"data: {json.dumps(final_payload, ensure_ascii=False)}\n\n".encode("utf-8")
+                        choice = {}
+                        try:
+                            choices = final_payload.get("choices")
+                            if isinstance(choices, list) and choices:
+                                choice = choices[0] if isinstance(choices[0], dict) else {}
+                        except Exception:
+                            choice = {}
+
+                        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+                        content = message.get("content") if isinstance(message.get("content"), str) else ""
+                        role = message.get("role") if isinstance(message.get("role"), str) else "assistant"
+
+                        chunk_payload = {
+                            "id": final_payload.get("id"),
+                            "object": "chat.completion.chunk",
+                            "created": final_payload.get("created"),
+                            "model": final_payload.get("model"),
+                            "choices": [
+                                {
+                                    "index": choice.get("index", 0) if isinstance(choice, dict) else 0,
+                                    "delta": {"role": role, "content": content},
+                                    "finish_reason": None
+                                }
+                            ]
+                        }
+                        yield f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+                        done_payload = {
+                            "id": final_payload.get("id"),
+                            "object": "chat.completion.chunk",
+                            "created": final_payload.get("created"),
+                            "model": final_payload.get("model"),
+                            "choices": [
+                                {
+                                    "index": choice.get("index", 0) if isinstance(choice, dict) else 0,
+                                    "delta": {},
+                                    "finish_reason": choice.get("finish_reason") or "stop"
+                                }
+                            ]
+                        }
+                        yield f"data: {json.dumps(done_payload, ensure_ascii=False)}\n\n".encode("utf-8")
                         yield b"data: [DONE]\n\n"
 
                     if total_tokens is not None:
@@ -1409,6 +1692,29 @@ async def delete_config(config_id: str):
 async def get_statistics():
     """获取请求统计数据 (包含日期重置逻辑)"""
     return await get_stats()
+
+
+@admin_router.post("/stats/config/{config_id}/unblock")
+async def unblock_config(config_id: str):
+    """手动解除指定配置项的熔断禁用状态。"""
+    stats = await read_json_file(STATS_FILE, get_default_stats())
+    config_stats = stats.get("by_config_id", {}).get(config_id)
+    if not isinstance(config_stats, dict):
+        raise HTTPException(status_code=404, detail="未找到该配置项的统计记录")
+
+    changed = False
+    if "disabled_until" in config_stats:
+        del config_stats["disabled_until"]
+        changed = True
+    if config_stats.get("consecutive_fails", 0) != 0:
+        config_stats["consecutive_fails"] = 0
+        changed = True
+
+    if changed:
+        await write_json_file(STATS_FILE, stats)
+        log_message(f"管理: 手动解除配置项 {config_id} 的熔断禁用状态")
+
+    return {"ok": True, "config_id": config_id, "changed": changed}
 
 
 @admin_router.get("/logs")

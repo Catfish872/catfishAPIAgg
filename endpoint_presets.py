@@ -3,7 +3,7 @@ import os
 import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin
 
 
@@ -135,8 +135,27 @@ def _clamp_n(value: Any) -> int:
     return max(1, min(4, n))
 
 
+def _clean_path(value: Any, default: str) -> str:
+    path = str(value or "").strip() or default
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
+
 def build_images_generations_payload(raw_body: Dict[str, Any], config: Any) -> Dict[str, Any]:
-    """构造标准 Images Generations 请求体；固定不发送 stream 字段。"""
+    """向后兼容：仅返回图片请求 body。新逻辑请使用 build_images_request_plan。"""
+    _, payload = build_images_request_plan(raw_body, config)
+    return payload
+
+
+def build_images_request_plan(raw_body: Dict[str, Any], config: Any) -> Tuple[str, Dict[str, Any]]:
+    """构造图片上游请求计划，返回 (path, payload)。
+
+    endpoint_preset=images_generations 只是选择图片预设；实际 path 由 image_upstream_mode 决定：
+    - openai_edit_image: 有参考图走 /images/edits，没图走 /images/generations
+    - generation_*: 始终走 /images/generations，并按模式映射参考图字段
+    - custom: 使用自定义路径和字段
+    """
     if not isinstance(raw_body, dict):
         raise EndpointPresetError("请求体必须是 JSON 对象")
 
@@ -152,15 +171,50 @@ def build_images_generations_payload(raw_body: Dict[str, Any], config: Any) -> D
         "size": raw_body.get("size") or raw_body.get("image_size") or raw_body.get("resolution") or "1024x1024",
     }
 
-    for key in ["response_format", "quality", "style", "user", "upscale"]:
+    for key in ["response_format", "quality", "style", "user", "upscale", "background", "output_format", "output_compression", "input_fidelity"]:
         if key in raw_body and raw_body.get(key) is not None:
             payload[key] = raw_body.get(key)
 
     reference_images = extract_image_urls_from_messages(raw_body.get("messages"))
-    if reference_images:
-        payload["reference_images"] = reference_images
+    has_refs = bool(reference_images)
+    mode = str(_config_get(config, "image_upstream_mode", "generation_reference_images_array") or "generation_reference_images_array")
+    generation_path = _clean_path(_config_get(config, "image_generation_path", "/images/generations"), "/images/generations")
+    edit_path = _clean_path(_config_get(config, "image_edit_path", "/images/edits"), "/images/edits")
 
-    return payload
+    if mode == "openai_edit_image":
+        if has_refs:
+            payload["image"] = reference_images[0]
+            return edit_path, payload
+        return generation_path, payload
+
+    if mode == "generation_images_array":
+        if has_refs:
+            payload["images"] = reference_images
+        return generation_path, payload
+
+    if mode == "generation_ref_assets_array":
+        if has_refs:
+            payload["ref_assets"] = reference_images
+        return generation_path, payload
+
+    if mode == "custom":
+        custom_generation_path = _clean_path(_config_get(config, "image_custom_generation_path", None), generation_path)
+        custom_edit_path = _clean_path(_config_get(config, "image_custom_edit_path", None), edit_path)
+        custom_field = str(_config_get(config, "image_custom_reference_field", "") or "").strip()
+        custom_mode = str(_config_get(config, "image_custom_reference_mode", "array") or "array")
+        include_empty = bool(_config_get(config, "image_custom_include_reference_when_empty", False))
+        path = custom_edit_path if has_refs else custom_generation_path
+        if custom_field and (has_refs or include_empty):
+            if custom_mode == "single":
+                payload[custom_field] = reference_images[0] if has_refs else ""
+            else:
+                payload[custom_field] = reference_images
+        return path, payload
+
+    # 默认保持旧桥接行为，避免破坏既有配置。
+    if has_refs:
+        payload["reference_images"] = reference_images
+    return generation_path, payload
 
 
 def _origin_from_upstream_url(upstream_url: str) -> Optional[str]:

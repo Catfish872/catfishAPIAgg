@@ -192,8 +192,48 @@
                                 </select>
                                 <small>
                                     Chat Completions：默认聊天端点，保持原行为。<br>
-                                    Images Generations：将 chat messages 自动合成为 prompt，并请求上游 /images/generations。适合接入图片生成接口；若消息中包含 image_url，会自动转换为 reference_images。
+                                    Images Generations：将 chat messages 自动合成为 prompt，并按下方“图像上游模式”选择实际图片端点和参考图字段；若上游返回 HTTP 202 + task_id，会自动轮询最终图片结果。
                                 </small>
+                            </div>
+                            <div id="image-options-group" class="input-group full-span image-options-group">
+                                <label for="config-image-upstream-mode">图像上游模式（仅 Images 预设生效）</label>
+                                <select id="config-image-upstream-mode">
+                                    <option value="generation_reference_images_array">Generation + reference_images 数组（旧兼容）</option>
+                                    <option value="generation_images_array">Generation + images 数组（GPT2API 推荐）</option>
+                                    <option value="generation_ref_assets_array">Generation + ref_assets 数组</option>
+                                    <option value="openai_edit_image">OpenAI Edit：有图走 /images/edits，无图走 /images/generations</option>
+                                    <option value="custom">自定义路径与参考图字段</option>
+                                </select>
+                                <small>这是图片预设内部的协议模板；下游仍然只需要发送 chat 多模态消息。</small>
+                                <div class="image-options-grid">
+                                    <div class="input-group">
+                                        <label for="config-image-generation-path">文生图路径</label>
+                                        <input type="text" id="config-image-generation-path" placeholder="/images/generations">
+                                    </div>
+                                    <div class="input-group">
+                                        <label for="config-image-edit-path">图生图/编辑路径</label>
+                                        <input type="text" id="config-image-edit-path" placeholder="/images/edits">
+                                    </div>
+                                    <div class="input-group">
+                                        <label for="config-image-task-poll-timeout">202 任务最大等待秒数</label>
+                                        <input type="number" id="config-image-task-poll-timeout" min="1" placeholder="300">
+                                    </div>
+                                    <div class="input-group">
+                                        <label for="config-image-task-poll-interval">202 任务轮询间隔秒数</label>
+                                        <input type="number" id="config-image-task-poll-interval" min="0.5" step="0.5" placeholder="2">
+                                    </div>
+                                    <div class="input-group image-custom-option">
+                                        <label for="config-image-custom-reference-field">自定义参考图字段名</label>
+                                        <input type="text" id="config-image-custom-reference-field" placeholder="例如 images / input_image">
+                                    </div>
+                                    <div class="input-group image-custom-option">
+                                        <label for="config-image-custom-reference-mode">自定义参考图字段模式</label>
+                                        <select id="config-image-custom-reference-mode">
+                                            <option value="array">数组：field: [url1, url2]</option>
+                                            <option value="single">单图：field: url1</option>
+                                        </select>
+                                    </div>
+                                </div>
                             </div>
                             <div class="input-group">
                                 <label for="config-user-agent-mode">User-Agent 模式</label>
@@ -308,10 +348,11 @@
                                 <th class="fail-text">失败</th>
                                 <th>连续失败</th>
                                 <th>禁用至</th>
+                                <th>操作</th>
                             </tr>
                         </thead>
                         <tbody id="stats-by-config-body">
-                            <tr><td colspan="6">加载中...</td></tr>
+                            <tr><td colspan="7">加载中...</td></tr>
                         </tbody>
                     </table>
                 </div>

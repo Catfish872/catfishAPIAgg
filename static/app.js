@@ -30,6 +30,15 @@ document.addEventListener("DOMContentLoaded", () => {
     const modelPickerSelect = document.getElementById("model-picker-select");
     const modelQueryStatus = document.getElementById("model-query-status");
     const configEndpointPresetInput = document.getElementById("config-endpoint-preset");
+    const imageOptionsGroup = document.getElementById("image-options-group");
+    const configImageUpstreamModeInput = document.getElementById("config-image-upstream-mode");
+    const configImageGenerationPathInput = document.getElementById("config-image-generation-path");
+    const configImageEditPathInput = document.getElementById("config-image-edit-path");
+    const configImageTaskPollTimeoutInput = document.getElementById("config-image-task-poll-timeout");
+    const configImageTaskPollIntervalInput = document.getElementById("config-image-task-poll-interval");
+    const configImageCustomReferenceFieldInput = document.getElementById("config-image-custom-reference-field");
+    const configImageCustomReferenceModeInput = document.getElementById("config-image-custom-reference-mode");
+    const imageCustomOptionEls = document.querySelectorAll(".image-custom-option");
     const configUserAgentModeInput = document.getElementById("config-user-agent-mode");
     const configCustomUserAgentInput = document.getElementById("config-custom-user-agent");
     const configFailureThresholdInput = document.getElementById("config-failure-threshold");
@@ -304,7 +313,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                 </td>
                                 <td>${config.max_retries ?? 0}</td>
                                 <td><small>${formatStreamModeStrategy(config.stream_mode_strategy)}</small></td>
-                                <td><small>${formatEndpointPreset(config.endpoint_preset)}</small></td>
+                                <td><small>${formatEndpointPreset(config.endpoint_preset)}${formatImageMode(config)}</small></td>
                                 <td><small>${formatUserAgentMode(config)}</small></td>
                                 <td><small>${formatInjectionSummary(config)}</small></td>
                                 <td><small>${formatOverridesSummary(config.request_overrides)}</small></td>
@@ -423,7 +432,7 @@ document.addEventListener("DOMContentLoaded", () => {
     function renderStatsTable(tbody, configs, statsData, isTotal) {
         tbody.innerHTML = "";
         if (configs.length === 0) {
-            tbody.innerHTML = `<tr><td colspan="${isTotal ? 6 : 4}">没有配置项</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="${isTotal ? 7 : 4}">没有配置项</td></tr>`;
             return;
         }
 
@@ -437,15 +446,38 @@ document.addEventListener("DOMContentLoaded", () => {
                 <td class="fail-text">${configStat.fail || 0}</td>
             `;
             if (isTotal) {
-                const disabledUntil = configStat.disabled_until ? new Date(configStat.disabled_until).toLocaleString() : '<em>-</em>';
+                const isBlocked = Boolean(configStat.disabled_until);
+                const disabledUntil = isBlocked ? new Date(configStat.disabled_until).toLocaleString() : '<em>-</em>';
+                const unblockButton = isBlocked
+                    ? `<button type="button" class="button button-secondary unblock-config-btn" data-config-id="${config.id}">解除禁用</button>`
+                    : '<em>-</em>';
                 rowHTML += `
                     <td>${configStat.consecutive_fails || 0}</td>
                     <td><small>${disabledUntil}</small></td>
+                    <td>${unblockButton}</td>
                 `;
             }
             tr.innerHTML = rowHTML;
             tbody.appendChild(tr);
         });
+    }
+
+    async function unblockConfig(configId) {
+        if (!configId) return;
+        try {
+            const response = await authedFetch(`/admin/stats/config/${encodeURIComponent(configId)}/unblock`, {
+                method: "POST"
+            });
+            if (!response) return;
+            if (!response.ok) {
+                const text = await response.text();
+                throw new Error(text || `HTTP ${response.status}`);
+            }
+            await loadStats();
+        } catch (err) {
+            console.error("解除熔断失败:", err);
+            alert(`解除禁用失败: ${err.message}`);
+        }
     }
 
 
@@ -514,9 +546,18 @@ document.addEventListener("DOMContentLoaded", () => {
         configUserAgentModeInput.value = "aggregator";
         configCustomUserAgentInput.value = "";
         updateCustomUserAgentVisibility();
+        updateImageOptionsVisibility();
         resetModelPicker("先查询后选择模型");
         configStreamModeStrategyInput.value = "passthrough";
         configRequestOverridesInput.value = "{}";
+        configImageUpstreamModeInput.value = "generation_reference_images_array";
+        configImageGenerationPathInput.value = "/images/generations";
+        configImageEditPathInput.value = "/images/edits";
+        configImageTaskPollTimeoutInput.value = "300";
+        configImageTaskPollIntervalInput.value = "2";
+        configImageCustomReferenceFieldInput.value = "";
+        configImageCustomReferenceModeInput.value = "array";
+        updateImageOptionsVisibility();
         renderInjectedMessagesEditor([]);
         cancelButton.classList.add("hidden");
     }
@@ -540,6 +581,14 @@ document.addEventListener("DOMContentLoaded", () => {
         configUserAgentModeInput.value = config.user_agent_mode || "aggregator";
         configCustomUserAgentInput.value = config.custom_user_agent || "";
         updateCustomUserAgentVisibility();
+        configImageUpstreamModeInput.value = config.image_upstream_mode || "generation_reference_images_array";
+        configImageGenerationPathInput.value = config.image_generation_path || "/images/generations";
+        configImageEditPathInput.value = config.image_edit_path || "/images/edits";
+        configImageTaskPollTimeoutInput.value = config.image_task_poll_timeout_seconds ?? 300;
+        configImageTaskPollIntervalInput.value = config.image_task_poll_interval_seconds ?? 2;
+        configImageCustomReferenceFieldInput.value = config.image_custom_reference_field || "";
+        configImageCustomReferenceModeInput.value = config.image_custom_reference_mode || "array";
+        updateImageOptionsVisibility();
         resetModelPicker("可查询并选择该 URL 下的模型");
         configStreamModeStrategyInput.value = config.stream_mode_strategy || "passthrough";
         renderInjectedMessagesEditor(config.injected_messages || [], config.injection_position || "prepend");
@@ -585,6 +634,13 @@ document.addEventListener("DOMContentLoaded", () => {
             user_agent_mode: configUserAgentModeInput.value || "aggregator",
             custom_user_agent: configCustomUserAgentInput.value || null,
             stream_mode_strategy: configStreamModeStrategyInput.value || "passthrough",
+            image_upstream_mode: configImageUpstreamModeInput.value || "generation_reference_images_array",
+            image_generation_path: configImageGenerationPathInput.value || "/images/generations",
+            image_edit_path: configImageEditPathInput.value || "/images/edits",
+            image_custom_reference_field: configImageCustomReferenceFieldInput.value || null,
+            image_custom_reference_mode: configImageCustomReferenceModeInput.value || "array",
+            image_task_poll_timeout_seconds: configImageTaskPollTimeoutInput.value ? parseInt(configImageTaskPollTimeoutInput.value, 10) : 300,
+            image_task_poll_interval_seconds: configImageTaskPollIntervalInput.value ? parseFloat(configImageTaskPollIntervalInput.value) : 2,
             injected_messages: getInjectedMessagesFromEditor(),
             consecutive_failure_threshold: configFailureThresholdInput.value ? parseInt(configFailureThresholdInput.value, 10) : null,
             disable_duration_seconds: configDisableDurationInput.value ? parseInt(configDisableDurationInput.value, 10) : null,
@@ -701,6 +757,14 @@ document.addEventListener("DOMContentLoaded", () => {
         modelQueryStatus.classList.toggle("fail-text", !!isError);
     }
 
+    function updateImageOptionsVisibility() {
+        if (!imageOptionsGroup || !configEndpointPresetInput || !configImageUpstreamModeInput) return;
+        const isImagesPreset = configEndpointPresetInput.value === "images_generations";
+        imageOptionsGroup.classList.toggle("hidden", !isImagesPreset);
+        const isCustom = configImageUpstreamModeInput.value === "custom";
+        imageCustomOptionEls.forEach(el => el.classList.toggle("hidden", !isCustom));
+    }
+
     function updateCustomUserAgentVisibility() {
         if (!configCustomUserAgentInput || !configUserAgentModeInput) return;
         const isCustom = configUserAgentModeInput.value === "custom";
@@ -720,6 +784,19 @@ document.addEventListener("DOMContentLoaded", () => {
     function formatStreamModeStrategy(strategy) {
         const normalized = strategy || "passthrough";
         return STREAM_STRATEGY_LABEL_MAP[normalized] || normalized;
+    }
+
+    function formatImageMode(config) {
+        if ((config.endpoint_preset || "chat_completions") !== "images_generations") return "";
+        const mode = config.image_upstream_mode || "generation_reference_images_array";
+        const labelMap = {
+            openai_edit_image: "OpenAI Edit",
+            generation_images_array: "Gen + images[]",
+            generation_ref_assets_array: "Gen + ref_assets[]",
+            generation_reference_images_array: "Gen + reference_images[]",
+            custom: "自定义图片模式"
+        };
+        return ` / ${labelMap[mode] || mode}`;
     }
 
     function formatEndpointPreset(preset) {
@@ -913,6 +990,14 @@ document.addEventListener("DOMContentLoaded", () => {
             });
         });
 
+        statsByConfigBody.addEventListener("click", async (e) => {
+            const button = e.target.closest(".unblock-config-btn");
+            if (!button) return;
+            button.disabled = true;
+            button.textContent = "解除中...";
+            await unblockConfig(button.dataset.configId);
+        });
+
         configForm.addEventListener("submit", handleFormSubmit);
         cancelButton.addEventListener("click", resetForm);
         addInjectedMessageButton.addEventListener("click", () => {
@@ -923,6 +1008,8 @@ document.addEventListener("DOMContentLoaded", () => {
             }));
         });
         configUserAgentModeInput.addEventListener("change", updateCustomUserAgentVisibility);
+        configEndpointPresetInput.addEventListener("change", updateImageOptionsVisibility);
+        configImageUpstreamModeInput.addEventListener("change", updateImageOptionsVisibility);
         queryModelsButton.addEventListener("click", handleQueryModels);
         modelPickerSelect.addEventListener("change", () => {
             if (modelPickerSelect.value) {

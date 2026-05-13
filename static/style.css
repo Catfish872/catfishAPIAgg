@@ -951,7 +951,8 @@ html[data-theme="claude"] .stat-card::after {
 
 /* --- 10. 表格操作、方案块与高级控件 --- */
 td .edit-btn,
-td .delete-btn {
+td .delete-btn,
+td .unblock-config-btn {
     padding: 0.36rem 0.62rem;
     font-size: 0.82rem;
     margin-right: 0.25rem;
@@ -1001,6 +1002,7 @@ td .edit-btn {
 
 .preset-card,
 .endpoint-preset-group,
+.image-options-group,
 .injected-message-row {
     border: 1px solid var(--theme-border);
     border-radius: var(--radius-lg);
@@ -1013,9 +1015,21 @@ td .edit-btn {
     padding: 1rem;
 }
 
-.endpoint-preset-group {
+.endpoint-preset-group,
+.image-options-group {
     padding: 1rem;
     border-color: var(--theme-border-strong);
+}
+
+.image-options-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1rem 1.1rem;
+    margin-top: 1rem;
+}
+
+@media (min-width: 600px) {
+    .image-options-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 .model-picker-row {
@@ -1135,7 +1149,8 @@ html[data-theme="deepseek"] .table-container {
 }
 
 html[data-theme="deepseek"] .scheme-header,
-html[data-theme="deepseek"] .endpoint-preset-group {
+html[data-theme="deepseek"] .endpoint-preset-group,
+html[data-theme="deepseek"] .image-options-group {
     clip-path: polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 14px 100%, 0 calc(100% - 14px));
 }
 
@@ -1497,6 +1512,7 @@ html[data-effects="off"] .tab-button.active,
 html[data-effects="off"] .logs-container,
 html[data-effects="off"] .preset-card,
 html[data-effects="off"] .endpoint-preset-group,
+html[data-effects="off"] .image-options-group,
 html[data-effects="off"] .injected-message-row,
 html[data-effects="off"] .model-dropdown-wrap,
 html[data-effects="off"] .data-node,
