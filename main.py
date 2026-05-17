@@ -1,5 +1,7 @@
 import os
 import asyncio
+import base64
+import re
 import httpx
 import uvicorn
 import collections
@@ -91,7 +93,7 @@ ImageUpstreamMode = Literal[
     "generation_reference_images_array",
     "custom"
 ]
-ImageCustomReferenceMode = Literal["single", "array"]
+ImageCustomReferenceMode = Literal["single", "array", "object_array"]
 
 
 class InjectedMessage(BaseModel):
@@ -130,7 +132,8 @@ class ApiConfigBase(BaseModel):
     image_custom_generation_path: Optional[str] = Field(None, description="自定义图片无图路径；为空使用 image_generation_path")
     image_custom_edit_path: Optional[str] = Field(None, description="自定义图片有图路径；为空使用 image_edit_path")
     image_custom_reference_field: Optional[str] = Field(None, description="自定义参考图字段名")
-    image_custom_reference_mode: Optional[ImageCustomReferenceMode] = Field("array", description="自定义参考图字段模式：single=第一张字符串，array=全部数组")
+    image_custom_reference_mode: Optional[ImageCustomReferenceMode] = Field("array", description="自定义参考图字段模式：single=第一张字符串，array=全部数组，object_array=对象数组")
+    image_custom_reference_object_url_field: Optional[str] = Field("image_url", description="自定义参考图对象数组模式下，对象内承载 URL 的字段名")
     image_custom_include_reference_when_empty: Optional[bool] = Field(False, description="无参考图时是否仍发送自定义空参考图字段")
     image_task_poll_timeout_seconds: Optional[int] = Field(300, description="图片 202 异步任务最大等待秒数，默认 300 秒")
     image_task_poll_interval_seconds: Optional[float] = Field(2.0, description="图片 202 异步任务轮询间隔秒数，默认 2 秒")
@@ -608,6 +611,72 @@ def extract_total_tokens(payload: Any) -> Optional[int]:
                 return total
 
     return None
+
+
+_OPENAI_EDIT_DATA_URL_RE = re.compile(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.*)$", re.DOTALL)
+
+
+def image_media_type_to_filename(media_type: str) -> str:
+    """根据图片 MIME 类型生成稳定的上传文件名。"""
+    normalized = (media_type or "image/png").lower().split(";")[0].strip()
+    extension_map = {
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+        "image/gif": "gif",
+        "image/bmp": "bmp",
+    }
+    return f"image.{extension_map.get(normalized, 'png')}"
+
+
+async def resolve_openai_edit_image_file(image_value: Any) -> tuple:
+    """把 chat 多模态参考图转换为 OpenAI /images/edits 标准 multipart 文件字段。"""
+    if not isinstance(image_value, str) or not image_value.strip():
+        raise EndpointPresetError("OpenAI Edit 模式需要有效的参考图 URL 或 data URL")
+
+    raw = image_value.strip()
+    data_url_match = _OPENAI_EDIT_DATA_URL_RE.match(raw)
+    if data_url_match:
+        media_type = data_url_match.group(1)
+        try:
+            image_bytes = base64.b64decode(data_url_match.group(2), validate=False)
+        except Exception as e:
+            raise EndpointPresetError(f"OpenAI Edit 参考图 data URL 解码失败: {e}")
+        if not image_bytes:
+            raise EndpointPresetError("OpenAI Edit 参考图 data URL 为空")
+        return (image_media_type_to_filename(media_type), image_bytes, media_type)
+
+    if raw.startswith("http://") or raw.startswith("https://"):
+        try:
+            response = await httpx_client.get(raw)
+            response.raise_for_status()
+        except Exception as e:
+            raise EndpointPresetError(f"OpenAI Edit 参考图下载失败: {e}")
+        media_type = response.headers.get("content-type", "image/png").split(";")[0].strip() or "image/png"
+        if not media_type.startswith("image/"):
+            media_type = "image/png"
+        image_bytes = response.content
+        if not image_bytes:
+            raise EndpointPresetError("OpenAI Edit 参考图下载结果为空")
+        return (image_media_type_to_filename(media_type), image_bytes, media_type)
+
+    raise EndpointPresetError("OpenAI Edit 标准 multipart 模式仅支持 data URL 或 http(s) 图片 URL")
+
+
+def build_openai_edit_multipart_data(payload: Dict[str, Any]) -> Dict[str, str]:
+    """从图片 payload 中提取 OpenAI /images/edits multipart 文本字段。"""
+    data: Dict[str, str] = {}
+    for key, value in payload.items():
+        if key == "image" or value is None:
+            continue
+        if isinstance(value, bool):
+            data[key] = "true" if value else "false"
+        elif isinstance(value, (dict, list)):
+            data[key] = json.dumps(value, ensure_ascii=False)
+        else:
+            data[key] = str(value)
+    return data
 
 
 def resolve_stream_modes(external_is_stream: bool, strategy: Optional[str]) -> Dict[str, Any]:
@@ -1092,7 +1161,20 @@ async def proxy_chat_completions(
                     if request_body.get("stream", False):
                         log_message(f"配置项 ID: {config.id} 使用 images_generations 预设，上游按非流式请求，向下游返回 fake SSE 图片 markdown")
 
-                    response = await httpx_client.post(images_proxy_url, headers=images_headers, json=images_body)
+                    is_standard_openai_edit = config.image_upstream_mode == "openai_edit_image" and images_path.rstrip("/").endswith("/images/edits") and isinstance(images_body.get("image"), str)
+                    if is_standard_openai_edit:
+                        multipart_headers = dict(images_headers)
+                        multipart_headers.pop("Content-Type", None)
+                        image_file = await resolve_openai_edit_image_file(images_body.get("image"))
+                        multipart_data = build_openai_edit_multipart_data(images_body)
+                        response = await httpx_client.post(
+                            images_proxy_url,
+                            headers=multipart_headers,
+                            data=multipart_data,
+                            files={"image": image_file}
+                        )
+                    else:
+                        response = await httpx_client.post(images_proxy_url, headers=images_headers, json=images_body)
                     response.raise_for_status()
                     image_task_accepted = False
 

@@ -201,7 +201,7 @@
                                     <option value="generation_reference_images_array">Generation + reference_images 数组（旧兼容）</option>
                                     <option value="generation_images_array">Generation + images 数组（GPT2API 推荐）</option>
                                     <option value="generation_ref_assets_array">Generation + ref_assets 数组</option>
-                                    <option value="openai_edit_image">OpenAI Edit：有图走 /images/edits，无图走 /images/generations</option>
+                                    <option value="openai_edit_image">OpenAI Edit 标准：有图 multipart /images/edits，无图 /images/generations</option>
                                     <option value="custom">自定义路径与参考图字段</option>
                                 </select>
                                 <small>这是图片预设内部的协议模板；下游仍然只需要发送 chat 多模态消息。</small>
@@ -231,7 +231,12 @@
                                         <select id="config-image-custom-reference-mode">
                                             <option value="array">数组：field: [url1, url2]</option>
                                             <option value="single">单图：field: url1</option>
+                                            <option value="object_array">对象数组：field: [{key: url1}]</option>
                                         </select>
+                                    </div>
+                                    <div class="input-group image-custom-option image-custom-object-option">
+                                        <label for="config-image-custom-reference-object-url-field">对象内 URL 字段名</label>
+                                        <input type="text" id="config-image-custom-reference-object-url-field" placeholder="例如 image_url / url">
                                     </div>
                                 </div>
                             </div>

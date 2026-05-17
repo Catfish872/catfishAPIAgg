@@ -202,11 +202,14 @@ def build_images_request_plan(raw_body: Dict[str, Any], config: Any) -> Tuple[st
         custom_edit_path = _clean_path(_config_get(config, "image_custom_edit_path", None), edit_path)
         custom_field = str(_config_get(config, "image_custom_reference_field", "") or "").strip()
         custom_mode = str(_config_get(config, "image_custom_reference_mode", "array") or "array")
+        object_url_field = str(_config_get(config, "image_custom_reference_object_url_field", "image_url") or "image_url").strip() or "image_url"
         include_empty = bool(_config_get(config, "image_custom_include_reference_when_empty", False))
         path = custom_edit_path if has_refs else custom_generation_path
         if custom_field and (has_refs or include_empty):
             if custom_mode == "single":
                 payload[custom_field] = reference_images[0] if has_refs else ""
+            elif custom_mode == "object_array":
+                payload[custom_field] = [{object_url_field: image_url} for image_url in reference_images] if has_refs else []
             else:
                 payload[custom_field] = reference_images
         return path, payload
@@ -334,7 +337,7 @@ def convert_response_base64_images_to_urls(
     - 字符串中的 data:image/...;base64,... 会被替换为 URL；
     - dict 中的 b64_json 会被保存，并补充/覆盖同级 url；
     - dict 中的 url / image_url 等字符串若是 data URL，会被替换为 URL；
-    - 保留原 b64_json 字段，避免破坏依赖原字段的调用方，但下游可优先读取 url。
+    - b64_json 保存成功后会从响应中移除，避免向下游和完整响应日志透传大块 base64。
     """
     if isinstance(payload, list):
         for index, item in enumerate(payload):
@@ -349,6 +352,7 @@ def convert_response_base64_images_to_urls(
                 current_url = payload.get("url")
                 if not isinstance(current_url, str) or not current_url.strip() or current_url.startswith("data:image/"):
                     payload["url"] = saved_url
+                payload.pop("b64_json", None)
 
         for key, value in list(payload.items()):
             if isinstance(value, str):
@@ -394,13 +398,10 @@ def wrap_image_response_as_chat_completion(
             if saved_url:
                 url = saved_url
 
-        if not url and not b64_json:
+        if not url:
             continue
-        images.append({"url": url, "b64_json": b64_json})
-        if url:
-            markdown_parts.append(f"![image]({url})")
-        elif b64_json:
-            markdown_parts.append(f"![image](data:image/png;base64,{b64_json})")
+        images.append({"url": url})
+        markdown_parts.append(f"![image]({url})")
 
     if not images:
         raise EndpointPresetError("上游 images_generations 响应未包含 url 或 b64_json")

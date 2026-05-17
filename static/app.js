@@ -38,7 +38,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const configImageTaskPollIntervalInput = document.getElementById("config-image-task-poll-interval");
     const configImageCustomReferenceFieldInput = document.getElementById("config-image-custom-reference-field");
     const configImageCustomReferenceModeInput = document.getElementById("config-image-custom-reference-mode");
+    const configImageCustomReferenceObjectUrlFieldInput = document.getElementById("config-image-custom-reference-object-url-field");
     const imageCustomOptionEls = document.querySelectorAll(".image-custom-option");
+    const imageCustomObjectOptionEls = document.querySelectorAll(".image-custom-object-option");
     const configUserAgentModeInput = document.getElementById("config-user-agent-mode");
     const configCustomUserAgentInput = document.getElementById("config-custom-user-agent");
     const configFailureThresholdInput = document.getElementById("config-failure-threshold");
@@ -557,6 +559,7 @@ document.addEventListener("DOMContentLoaded", () => {
         configImageTaskPollIntervalInput.value = "2";
         configImageCustomReferenceFieldInput.value = "";
         configImageCustomReferenceModeInput.value = "array";
+        configImageCustomReferenceObjectUrlFieldInput.value = "image_url";
         updateImageOptionsVisibility();
         renderInjectedMessagesEditor([]);
         cancelButton.classList.add("hidden");
@@ -588,6 +591,7 @@ document.addEventListener("DOMContentLoaded", () => {
         configImageTaskPollIntervalInput.value = config.image_task_poll_interval_seconds ?? 2;
         configImageCustomReferenceFieldInput.value = config.image_custom_reference_field || "";
         configImageCustomReferenceModeInput.value = config.image_custom_reference_mode || "array";
+        configImageCustomReferenceObjectUrlFieldInput.value = config.image_custom_reference_object_url_field || "image_url";
         updateImageOptionsVisibility();
         resetModelPicker("可查询并选择该 URL 下的模型");
         configStreamModeStrategyInput.value = config.stream_mode_strategy || "passthrough";
@@ -639,6 +643,7 @@ document.addEventListener("DOMContentLoaded", () => {
             image_edit_path: configImageEditPathInput.value || "/images/edits",
             image_custom_reference_field: configImageCustomReferenceFieldInput.value || null,
             image_custom_reference_mode: configImageCustomReferenceModeInput.value || "array",
+            image_custom_reference_object_url_field: configImageCustomReferenceObjectUrlFieldInput.value || "image_url",
             image_task_poll_timeout_seconds: configImageTaskPollTimeoutInput.value ? parseInt(configImageTaskPollTimeoutInput.value, 10) : 300,
             image_task_poll_interval_seconds: configImageTaskPollIntervalInput.value ? parseFloat(configImageTaskPollIntervalInput.value) : 2,
             injected_messages: getInjectedMessagesFromEditor(),
@@ -762,7 +767,9 @@ document.addEventListener("DOMContentLoaded", () => {
         const isImagesPreset = configEndpointPresetInput.value === "images_generations";
         imageOptionsGroup.classList.toggle("hidden", !isImagesPreset);
         const isCustom = configImageUpstreamModeInput.value === "custom";
+        const isObjectArray = isCustom && configImageCustomReferenceModeInput && configImageCustomReferenceModeInput.value === "object_array";
         imageCustomOptionEls.forEach(el => el.classList.toggle("hidden", !isCustom));
+        imageCustomObjectOptionEls.forEach(el => el.classList.toggle("hidden", !isObjectArray));
     }
 
     function updateCustomUserAgentVisibility() {
@@ -790,7 +797,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if ((config.endpoint_preset || "chat_completions") !== "images_generations") return "";
         const mode = config.image_upstream_mode || "generation_reference_images_array";
         const labelMap = {
-            openai_edit_image: "OpenAI Edit",
+            openai_edit_image: "OpenAI Edit multipart",
             generation_images_array: "Gen + images[]",
             generation_ref_assets_array: "Gen + ref_assets[]",
             generation_reference_images_array: "Gen + reference_images[]",
@@ -1010,6 +1017,7 @@ document.addEventListener("DOMContentLoaded", () => {
         configUserAgentModeInput.addEventListener("change", updateCustomUserAgentVisibility);
         configEndpointPresetInput.addEventListener("change", updateImageOptionsVisibility);
         configImageUpstreamModeInput.addEventListener("change", updateImageOptionsVisibility);
+        configImageCustomReferenceModeInput.addEventListener("change", updateImageOptionsVisibility);
         queryModelsButton.addEventListener("click", handleQueryModels);
         modelPickerSelect.addEventListener("change", () => {
             if (modelPickerSelect.value) {
