@@ -70,8 +70,8 @@ show_full_response_body = False
 file_lock = asyncio.Lock()
 
 # 全局 httpx 客户端 (用于连接池)
-# 设置一个合理的超时时间，例如 90 秒
-httpx_client = httpx.AsyncClient(timeout=90.0)
+# 设置一个合理的超时时间，例如 300 秒，兼容耗时较长的同步生图请求
+httpx_client = httpx.AsyncClient(timeout=300.0)
 
 # FastAPI 应用实例
 app = FastAPI(

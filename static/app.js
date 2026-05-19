@@ -15,6 +15,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const tabs = document.querySelectorAll(".tab-button");
     const tabContents = document.querySelectorAll(".tab-content");
     const themeOptions = document.querySelectorAll(".theme-option");
+    const configBackToTopButton = document.getElementById("config-back-to-top");
 
     // 配置 Tab
     const configSchemesContainer = document.getElementById("config-schemes-container");
@@ -277,7 +278,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     // [重构] 加载并渲染所有方案配置
-    async function loadConfigs() {
+    async function loadConfigs(options = {}) {
         try {
             const response = await authedFetch("/admin/config");
             if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
@@ -306,7 +307,13 @@ document.addEventListener("DOMContentLoaded", () => {
                     configs.forEach(config => {
                         tableRows += `
                             <tr data-config-id="${config.id}" data-scheme-name="${schemeName}">
-                                <td>${config.priority}</td>
+                                <td>
+                                    <div class="priority-stepper" aria-label="调整优先级">
+                                        <button type="button" class="priority-step-btn priority-up-btn" title="优先级 +1（数字减小）">▲</button>
+                                        <span class="priority-value">${config.priority}</span>
+                                        <button type="button" class="priority-step-btn priority-down-btn" title="优先级 -1（数字增大）">▼</button>
+                                    </div>
+                                </td>
                                 <td><small>${config.url}</small></td>
                                 <td><small>${formatApiKeyForDisplay(config.api_key)}</small></td>
                                 <td>${config.model || '<em>(使用原始)</em>'}</td>
@@ -321,8 +328,11 @@ document.addEventListener("DOMContentLoaded", () => {
                                 <td><small>${formatOverridesSummary(config.request_overrides)}</small></td>
                                 <td><small>${config.id}</small></td>
                                 <td>
-                                    <button class="button edit-btn">编辑</button>
-                                    <button class="button danger delete-btn">删除</button>
+                                    <div class="config-row-actions">
+                                        <button type="button" class="button edit-btn">编辑</button>
+                                        <button type="button" class="button copy-btn">复制</button>
+                                        <button type="button" class="button danger delete-btn">删除</button>
+                                    </div>
                                 </td>
                             </tr>
                         `;
@@ -369,6 +379,10 @@ document.addEventListener("DOMContentLoaded", () => {
                 configSchemesContainer.appendChild(schemeBlock);
             });
 
+            if (options.animateConfigId) {
+                animateConfigRowMove(options.animateConfigId, options.fromRect);
+            }
+
             configSchemesContainer.querySelectorAll('.api-key-visibility-btn').forEach(btn => {
                 btn.addEventListener('click', () => setApiKeyVisibility(!showApiKeys));
             });
@@ -392,6 +406,24 @@ document.addEventListener("DOMContentLoaded", () => {
                     const configId = row.dataset.configId;
                     const schemeName = row.dataset.schemeName;
                     populateFormForEdit(allSchemesCache[schemeName].find(c => c.id === configId), schemeName);
+                });
+            });
+            configSchemesContainer.querySelectorAll('.priority-up-btn, .priority-down-btn').forEach(btn => {
+                const row = btn.closest('tr');
+                btn.addEventListener('click', async () => {
+                    const configId = row.dataset.configId;
+                    const schemeName = row.dataset.schemeName;
+                    const config = allSchemesCache[schemeName].find(c => c.id === configId);
+                    const delta = btn.classList.contains('priority-up-btn') ? -1 : 1;
+                    await adjustConfigPriority(config, delta, btn);
+                });
+            });
+            configSchemesContainer.querySelectorAll('.copy-btn').forEach(btn => {
+                const row = btn.closest('tr');
+                btn.addEventListener('click', () => {
+                    const configId = row.dataset.configId;
+                    const schemeName = row.dataset.schemeName;
+                    populateFormForCopy(allSchemesCache[schemeName].find(c => c.id === configId), schemeName);
                 });
             });
             configSchemesContainer.querySelectorAll('.delete-btn').forEach(btn => {
@@ -565,12 +597,12 @@ document.addEventListener("DOMContentLoaded", () => {
         cancelButton.classList.add("hidden");
     }
 
-    // [重构] 填充表单
-    function populateFormForEdit(config, schemeName) {
-        formTitle.textContent = "编辑配置项";
-        configIdInput.value = config.id;
+    function populateConfigForm(config, schemeName, options = {}) {
+        const isCopy = options.mode === "copy";
+        formTitle.textContent = isCopy ? "复制配置项为新配置" : "编辑配置项";
+        configIdInput.value = isCopy ? "" : config.id;
         configSchemeInput.value = schemeName;
-        configSchemeInput.disabled = true; // 编辑时不允许修改方案
+        configSchemeInput.disabled = !isCopy; // 编辑时不允许修改方案；复制时作为新配置允许调整方案
         configPriorityInput.value = config.priority;
         configUrlInput.value = config.url;
         configKeyInput.value = config.api_key;
@@ -600,6 +632,97 @@ document.addEventListener("DOMContentLoaded", () => {
         configForm.scrollIntoView({ behavior: areEffectsEnabled() ? "smooth" : "auto", block: "start" });
     }
 
+    // [重构] 填充表单
+    function populateFormForEdit(config, schemeName) {
+        populateConfigForm(config, schemeName, { mode: "edit" });
+    }
+
+    function populateFormForCopy(config, schemeName) {
+        populateConfigForm(config, schemeName, { mode: "copy" });
+    }
+
+    function buildConfigUpdatePayload(config, overrides = {}) {
+        return {
+            priority: overrides.priority ?? config.priority,
+            url: overrides.url ?? config.url,
+            api_key: overrides.api_key ?? config.api_key,
+            model: overrides.model ?? config.model ?? null,
+            max_retries: overrides.max_retries ?? config.max_retries ?? 0,
+            request_overrides: overrides.request_overrides ?? config.request_overrides ?? {},
+            injection_position: overrides.injection_position ?? config.injection_position ?? "prepend",
+            endpoint_preset: overrides.endpoint_preset ?? config.endpoint_preset ?? "chat_completions",
+            user_agent_mode: overrides.user_agent_mode ?? config.user_agent_mode ?? "aggregator",
+            custom_user_agent: overrides.custom_user_agent ?? config.custom_user_agent ?? null,
+            stream_mode_strategy: overrides.stream_mode_strategy ?? config.stream_mode_strategy ?? "passthrough",
+            image_upstream_mode: overrides.image_upstream_mode ?? config.image_upstream_mode ?? "generation_reference_images_array",
+            image_generation_path: overrides.image_generation_path ?? config.image_generation_path ?? "/images/generations",
+            image_edit_path: overrides.image_edit_path ?? config.image_edit_path ?? "/images/edits",
+            image_custom_reference_field: overrides.image_custom_reference_field ?? config.image_custom_reference_field ?? null,
+            image_custom_reference_mode: overrides.image_custom_reference_mode ?? config.image_custom_reference_mode ?? "array",
+            image_custom_reference_object_url_field: overrides.image_custom_reference_object_url_field ?? config.image_custom_reference_object_url_field ?? "image_url",
+            image_task_poll_timeout_seconds: overrides.image_task_poll_timeout_seconds ?? config.image_task_poll_timeout_seconds ?? 300,
+            image_task_poll_interval_seconds: overrides.image_task_poll_interval_seconds ?? config.image_task_poll_interval_seconds ?? 2,
+            injected_messages: overrides.injected_messages ?? config.injected_messages ?? [],
+            consecutive_failure_threshold: overrides.consecutive_failure_threshold ?? config.consecutive_failure_threshold ?? null,
+            disable_duration_seconds: overrides.disable_duration_seconds ?? config.disable_duration_seconds ?? null,
+        };
+    }
+
+    function animateConfigRowMove(configId, fromRect) {
+        if (!configId || !fromRect || !areEffectsEnabled()) return;
+        const targetRow = configSchemesContainer.querySelector(`tr[data-config-id="${CSS.escape(configId)}"]`);
+        if (!targetRow) return;
+
+        const toRect = targetRow.getBoundingClientRect();
+        const deltaY = fromRect.top - toRect.top;
+        const deltaX = fromRect.left - toRect.left;
+        if (Math.abs(deltaY) < 1 && Math.abs(deltaX) < 1) return;
+
+        const ghostTable = document.createElement("table");
+        const ghostBody = document.createElement("tbody");
+        const ghostRow = targetRow.cloneNode(true);
+        ghostTable.className = "config-row-move-ghost";
+        ghostTable.style.left = `${fromRect.left}px`;
+        ghostTable.style.top = `${fromRect.top}px`;
+        ghostTable.style.width = `${fromRect.width}px`;
+        ghostTable.style.height = `${fromRect.height}px`;
+        ghostRow.querySelectorAll("button").forEach(button => button.disabled = true);
+        ghostBody.appendChild(ghostRow);
+        ghostTable.appendChild(ghostBody);
+        document.body.appendChild(ghostTable);
+
+        targetRow.classList.add("config-row-move-target");
+        requestAnimationFrame(() => {
+            ghostTable.style.transform = `translate(${-deltaX}px, ${-deltaY}px)`;
+            ghostTable.style.opacity = "0";
+            targetRow.classList.remove("config-row-move-target");
+        });
+
+        ghostTable.addEventListener("transitionend", () => {
+            ghostTable.remove();
+        }, { once: true });
+    }
+
+    async function adjustConfigPriority(config, delta, triggerButton) {
+        if (!config) return;
+        const currentPriority = Number.parseInt(config.priority, 10);
+        const nextPriority = Math.max(1, (Number.isNaN(currentPriority) ? 1 : currentPriority) + delta);
+        if (nextPriority === currentPriority) return;
+
+        const currentRow = triggerButton ? triggerButton.closest('tr') : null;
+        const fromRect = currentRow ? currentRow.getBoundingClientRect() : null;
+        if (triggerButton) triggerButton.disabled = true;
+        try {
+            const data = buildConfigUpdatePayload(config, { priority: nextPriority });
+            const response = await authedFetch(`/admin/config/${config.id}`, { method: "PUT", body: JSON.stringify(data) });
+            if (!response.ok) throw new Error((await response.json()).detail || "更新优先级失败");
+            await loadConfigs({ animateConfigId: config.id, fromRect });
+        } catch (err) {
+            alert(`更新优先级失败: ${err.message}`);
+            if (triggerButton) triggerButton.disabled = false;
+        }
+    }
+
     // [重构] 处理表单提交
     async function handleFormSubmit(e) {
         e.preventDefault();
@@ -626,7 +749,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const retryParsed = retryRaw === "" ? 0 : parseInt(retryRaw, 10);
         const maxRetries = Number.isNaN(retryParsed) || retryParsed < 0 ? 0 : retryParsed;
 
-        const data = {
+        const data = buildConfigUpdatePayload({}, {
             priority: parseInt(configPriorityInput.value, 10),
             url: configUrlInput.value,
             api_key: configKeyInput.value,
@@ -649,7 +772,7 @@ document.addEventListener("DOMContentLoaded", () => {
             injected_messages: getInjectedMessagesFromEditor(),
             consecutive_failure_threshold: configFailureThresholdInput.value ? parseInt(configFailureThresholdInput.value, 10) : null,
             disable_duration_seconds: configDisableDurationInput.value ? parseInt(configDisableDurationInput.value, 10) : null,
-        };
+        });
         
         let url, method;
         if (isEditing) {
@@ -988,14 +1111,29 @@ document.addEventListener("DOMContentLoaded", () => {
         });
         logoutButton.addEventListener("click", () => showLogin("您已退出登录"));
 
+        function updateConfigBackToTopVisibility() {
+            if (!configBackToTopButton) return;
+            const activeTab = document.querySelector(".tab-button.active");
+            const isConfigTab = activeTab && activeTab.dataset.tab === "config";
+            configBackToTopButton.classList.toggle("hidden", !isConfigTab);
+        }
+
         tabs.forEach(tab => {
             tab.addEventListener("click", () => {
                 tabs.forEach(t => t.classList.remove("active"));
                 tabContents.forEach(c => c.classList.remove("active"));
                 tab.classList.add("active");
                 document.getElementById(tab.dataset.tab + "-tab").classList.add("active");
+                updateConfigBackToTopVisibility();
             });
         });
+
+        if (configBackToTopButton) {
+            configBackToTopButton.addEventListener("click", () => {
+                window.scrollTo({ top: 0, behavior: areEffectsEnabled() ? "smooth" : "auto" });
+            });
+            updateConfigBackToTopVisibility();
+        }
 
         statsByConfigBody.addEventListener("click", async (e) => {
             const button = e.target.closest(".unblock-config-btn");

@@ -830,6 +830,93 @@ textarea {
     animation: content-in calc(0.36s / var(--motion-scale)) ease both;
 }
 
+.back-to-top-button {
+    position: fixed;
+    right: clamp(1rem, 3vw, 2rem);
+    bottom: clamp(1rem, 3vw, 2rem);
+    z-index: 80;
+    width: 3.35rem;
+    height: 3.35rem;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.52);
+    border-radius: 999px;
+    background:
+        radial-gradient(circle at 32% 25%, rgba(255, 255, 255, 0.56), transparent 28%),
+        var(--theme-button-gradient);
+    color: #fff;
+    box-shadow: var(--theme-glow), 0 16px 38px rgba(15, 23, 42, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.36);
+    backdrop-filter: blur(18px);
+    isolation: isolate;
+}
+
+.back-to-top-button::before {
+    content: "";
+    position: absolute;
+    inset: 0.38rem;
+    border: 1px solid rgba(255, 255, 255, 0.38);
+    border-radius: inherit;
+    opacity: 0.92;
+    pointer-events: none;
+}
+
+.back-to-top-button::after {
+    content: "";
+    position: absolute;
+    width: 120%;
+    height: 120%;
+    background: linear-gradient(120deg, transparent 28%, rgba(255, 255, 255, 0.45) 46%, transparent 64%);
+    transform: translateX(-120%) rotate(18deg);
+    transition: transform calc(0.55s / var(--motion-scale)) ease;
+    pointer-events: none;
+}
+
+.back-to-top-ring {
+    position: absolute;
+    inset: 0.22rem;
+    border-radius: inherit;
+    background: conic-gradient(from 180deg, rgba(255, 255, 255, 0.18), rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.18));
+    opacity: 0.58;
+    mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1px));
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1px));
+    pointer-events: none;
+}
+
+.back-to-top-icon {
+    position: relative;
+    z-index: 1;
+    width: 1.42rem;
+    height: 1.42rem;
+    fill: currentColor;
+    filter: drop-shadow(0 2px 4px rgba(15, 23, 42, 0.22));
+    transition: transform calc(0.22s / var(--motion-scale)) ease;
+}
+
+.back-to-top-button:hover {
+    transform: translateY(-4px) scale(1.03);
+    box-shadow: var(--theme-glow), 0 20px 48px rgba(15, 23, 42, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.42);
+}
+
+.back-to-top-button:hover::after {
+    transform: translateX(120%) rotate(18deg);
+}
+
+.back-to-top-button:hover .back-to-top-icon {
+    transform: translateY(-2px);
+}
+
+.back-to-top-button:active {
+    transform: translateY(-1px) scale(0.98);
+}
+
+html[data-effects="off"] .back-to-top-button,
+html[data-effects="off"] .back-to-top-icon,
+html[data-effects="off"] .back-to-top-button::after {
+    transition: none !important;
+}
+
 /* --- 8. 统计卡片 --- */
 .stats-grid {
     display: grid;
@@ -950,7 +1037,86 @@ html[data-theme="claude"] .stat-card::after {
 }
 
 /* --- 10. 表格操作、方案块与高级控件 --- */
+.config-row-move-ghost {
+    position: fixed;
+    z-index: 120;
+    table-layout: fixed;
+    border-collapse: separate;
+    border-spacing: 0;
+    pointer-events: none;
+    opacity: 0.94;
+    overflow: hidden;
+    border-radius: var(--radius-xl);
+    box-shadow: var(--theme-glow), 0 22px 58px rgba(15, 23, 42, 0.18);
+    transition: transform calc(0.42s / var(--motion-scale)) cubic-bezier(0.2, 0.82, 0.2, 1), opacity calc(0.38s / var(--motion-scale)) ease;
+    will-change: transform, opacity;
+}
+
+.config-row-move-ghost td {
+    background: var(--theme-surface-strong);
+}
+
+.config-row-move-target {
+    animation: row-target-pulse calc(0.42s / var(--motion-scale)) ease both;
+}
+
+@keyframes row-target-pulse {
+    from { opacity: 0.38; }
+    to { opacity: 1; }
+}
+
+.priority-stepper {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.18rem;
+    min-width: 2.15rem;
+}
+
+.priority-value {
+    font-weight: 700;
+    color: var(--color-text);
+    line-height: 1.05;
+}
+
+.priority-step-btn {
+    width: 1.75rem;
+    height: 1.35rem;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--theme-border);
+    border-radius: var(--radius-pill);
+    background: var(--theme-surface-soft);
+    color: var(--color-primary);
+    font-size: 0.68rem;
+    line-height: 1;
+    box-shadow: none;
+}
+
+.priority-step-btn:hover {
+    background: var(--theme-button-gradient);
+    color: #fff;
+    transform: translateY(-1px);
+    box-shadow: var(--theme-glow);
+}
+
+.priority-step-btn:disabled {
+    opacity: 0.55;
+    cursor: wait;
+}
+
+.config-row-actions {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.38rem;
+}
+
 td .edit-btn,
+td .copy-btn,
 td .delete-btn,
 td .unblock-config-btn {
     padding: 0.36rem 0.62rem;
@@ -958,10 +1124,16 @@ td .unblock-config-btn {
     margin-right: 0.25rem;
 }
 
-td .edit-btn {
+td .edit-btn,
+td .copy-btn {
     background: var(--theme-surface);
     border: 1px solid var(--theme-border);
     color: var(--color-text);
+}
+
+td .copy-btn {
+    background: var(--theme-surface-soft);
+    color: var(--color-primary);
 }
 
 .scheme-block {
