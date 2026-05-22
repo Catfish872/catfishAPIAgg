@@ -8,6 +8,7 @@ import collections
 import aiofiles
 import json
 import uuid
+import ipaddress
 from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Dict, Literal
@@ -55,6 +56,8 @@ STATS_FILE = os.path.join(DATA_DIR, "stats.json")
 # 生成图片文件目录与对外访问路径
 GENERATED_IMAGES_DIR = os.path.join(DATA_DIR, "generated_images")
 GENERATED_IMAGES_ROUTE = "/generated-images"
+# IP 连续认证失败自动封禁阈值；封禁后需在控制台手动解除
+IP_FAILURE_BAN_THRESHOLD = 5
 
 # 确保数据目录存在
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -252,13 +255,43 @@ def get_default_stats():
             "by_config_id": {}  # [新增] 今日按配置统计
         },
         "by_config_id": {},
-        "round_robin_state": {}  # [新增] 轮询状态
+        "round_robin_state": {},  # [新增] 轮询状态
+        "by_ip": {}  # IP 请求/认证统计与封禁状态
     }
+
+
+def normalize_stats_structure(stats: Any) -> dict:
+    """兼容旧版 stats.json，补齐新增统计字段，避免旧数据读取后缺字段。"""
+    default_stats = get_default_stats()
+    if not isinstance(stats, dict):
+        stats = default_stats
+
+    if not isinstance(stats.get("total"), dict):
+        stats["total"] = default_stats["total"]
+    stats["total"].setdefault("success", 0)
+    stats["total"].setdefault("fail", 0)
+
+    if not isinstance(stats.get("today"), dict):
+        stats["today"] = default_stats["today"]
+    stats["today"].setdefault("date", default_stats["today"]["date"])
+    stats["today"].setdefault("success", 0)
+    stats["today"].setdefault("fail", 0)
+    if not isinstance(stats["today"].get("by_config_id"), dict):
+        stats["today"]["by_config_id"] = {}
+
+    if not isinstance(stats.get("by_config_id"), dict):
+        stats["by_config_id"] = {}
+    if not isinstance(stats.get("round_robin_state"), dict):
+        stats["round_robin_state"] = {}
+    if not isinstance(stats.get("by_ip"), dict):
+        stats["by_ip"] = {}
+
+    return stats
 
 
 async def get_stats() -> dict:
     """获取统计数据，并处理日期重置"""
-    stats = await read_json_file(STATS_FILE, get_default_stats())
+    stats = normalize_stats_structure(await read_json_file(STATS_FILE, get_default_stats()))
 
     # 检查日期是否是今天，如果不是，重置 today 并更新日期
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -281,6 +314,165 @@ async def get_stats() -> dict:
     return stats
 
 
+def normalize_ip_candidate(value: Optional[str]) -> Optional[str]:
+    """从头部候选值中提取并校验 IP，避免伪造头部携带任意字符串污染统计页。"""
+    if not value:
+        return None
+    candidate = value.strip().strip('"').strip("'")
+    if not candidate:
+        return None
+
+    # 兼容 IPv4:port；IPv6 不在这里按冒号切分，避免破坏 IPv6 字面量。
+    if candidate.count(":") == 1 and "." in candidate:
+        candidate = candidate.rsplit(":", 1)[0]
+
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def get_client_ip(request: Request) -> str:
+    """优先从常见反代头识别真实客户端 IP，最后回退到直连地址。"""
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        for item in forwarded_for.split(","):
+            ip = normalize_ip_candidate(item)
+            if ip:
+                return ip
+
+    for header_name in ["x-real-ip", "cf-connecting-ip"]:
+        ip = normalize_ip_candidate(request.headers.get(header_name))
+        if ip:
+            return ip
+
+    if request.client and request.client.host:
+        ip = normalize_ip_candidate(request.client.host)
+        if ip:
+            return ip
+    return "unknown"
+
+
+def is_admin_authorization_valid(request: Request) -> bool:
+    """判断请求是否携带正确管理员密钥；用于已封禁 IP 的安全解封通道。"""
+    if not ADMIN_KEY:
+        return False
+    authorization = request.headers.get("authorization")
+    x_api_key = request.headers.get("x-api-key")
+    return authorization == f"Bearer {ADMIN_KEY}" or x_api_key == ADMIN_KEY
+
+
+async def read_stats_unlocked() -> dict:
+    """仅在已持有 file_lock 时调用：读取并归一化 stats。"""
+    default_data = get_default_stats()
+    stats = default_data
+    try:
+        if os.path.exists(STATS_FILE):
+            async with aiofiles.open(STATS_FILE, 'r', encoding='utf-8') as f:
+                content = await f.read()
+                if content:
+                    stats = json.loads(content)
+        else:
+            async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(default_data, indent=2, ensure_ascii=False))
+    except Exception as e:
+        log_message(f"读取/创建 {STATS_FILE} 失败: {e}. 使用默认值。")
+        stats = default_data
+    return normalize_stats_structure(stats)
+
+
+async def write_stats_unlocked(stats: dict):
+    """仅在已持有 file_lock 时调用：写入 stats。"""
+    async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
+        await f.write(json.dumps(stats, indent=2, ensure_ascii=False))
+
+
+async def get_ip_stats_entry(ip: str) -> Optional[dict]:
+    """读取指定 IP 的统计项。"""
+    stats = await get_stats()
+    entry = stats.get("by_ip", {}).get(ip)
+    return entry if isinstance(entry, dict) else None
+
+
+def ensure_ip_stats_entry(stats: dict, ip: str) -> dict:
+    """确保 IP 统计项存在并补齐字段。"""
+    by_ip = stats.setdefault("by_ip", {})
+    entry = by_ip.setdefault(ip, {})
+    entry.setdefault("total", 0)
+    entry.setdefault("success", 0)
+    entry.setdefault("fail", 0)
+    entry.setdefault("consecutive_fails", 0)
+    entry.setdefault("is_banned", False)
+    entry.setdefault("banned_at", None)
+    entry.setdefault("last_seen_at", None)
+    entry.setdefault("last_success_at", None)
+    entry.setdefault("last_fail_at", None)
+    entry.setdefault("last_fail_reason", None)
+    return entry
+
+
+async def record_ip_request_seen(ip: str):
+    """在全局中间件中记录每一次进入服务的请求 IP。"""
+    now_str = datetime.now().isoformat()
+    async with file_lock:
+        stats = await read_stats_unlocked()
+        entry = ensure_ip_stats_entry(stats, ip)
+        entry["total"] = int(entry.get("total", 0) or 0) + 1
+        entry["last_seen_at"] = now_str
+        try:
+            await write_stats_unlocked(stats)
+        except Exception as e:
+            log_message(f"写入 IP 请求统计失败: {e}")
+
+
+async def record_ip_auth_result(request: Request, is_success: bool, reason: str = ""):
+    """记录认证成功/失败；连续失败达到阈值后永久封禁，成功则清零连续失败。"""
+    ip = get_client_ip(request)
+    now_str = datetime.now().isoformat()
+
+    async with file_lock:
+        stats = await read_stats_unlocked()
+        entry = ensure_ip_stats_entry(stats, ip)
+        entry["last_seen_at"] = now_str
+
+        if is_success:
+            entry["success"] = int(entry.get("success", 0) or 0) + 1
+            entry["consecutive_fails"] = 0
+            entry["last_success_at"] = now_str
+        else:
+            entry["fail"] = int(entry.get("fail", 0) or 0) + 1
+            entry["consecutive_fails"] = int(entry.get("consecutive_fails", 0) or 0) + 1
+            entry["last_fail_at"] = now_str
+            entry["last_fail_reason"] = reason or "认证失败"
+            if entry["consecutive_fails"] >= IP_FAILURE_BAN_THRESHOLD and not entry.get("is_banned"):
+                entry["is_banned"] = True
+                entry["banned_at"] = now_str
+                log_message(f"IP 自动封禁: {ip} 连续认证失败 {entry['consecutive_fails']} 次，已永久封禁，需控制台手动解除")
+
+        try:
+            await write_stats_unlocked(stats)
+        except Exception as e:
+            log_message(f"写入 IP 统计失败: {e}")
+
+
+@app.middleware("http")
+async def ip_ban_middleware(request: Request, call_next):
+    """全局 IP 封禁拦截：覆盖所有路径；正确管理员密钥访问 IP 解封接口时允许穿透。"""
+    ip = get_client_ip(request)
+    await record_ip_request_seen(ip)
+    entry = await get_ip_stats_entry(ip)
+    is_banned = bool(entry and entry.get("is_banned"))
+
+    is_ip_unblock_path = request.url.path.startswith("/admin/stats/ip/") and request.url.path.endswith("/unblock")
+    if is_banned and not (is_ip_unblock_path and is_admin_authorization_valid(request)):
+        return JSONResponse(status_code=403, content={
+            "error": "当前 IP 已因连续认证失败被封禁，请在控制台手动解除",
+            "ip": ip
+        })
+
+    return await call_next(request)
+
+
 async def update_stats_and_state(
         config: ApiConfig,
         is_success: bool,
@@ -294,21 +486,7 @@ async def update_stats_and_state(
     """
     async with file_lock:
         # --- 1. 直接在锁内进行无锁的文件读取 ---
-        default_data = get_default_stats()
-        stats = default_data
-        try:
-            if os.path.exists(STATS_FILE):
-                async with aiofiles.open(STATS_FILE, 'r', encoding='utf-8') as f:
-                    content = await f.read()
-                    if content:
-                        stats = json.loads(content)
-            else:
-                # 文件不存在，使用默认值并尝试写入
-                async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
-                    await f.write(json.dumps(default_data, indent=2))
-        except Exception as e:
-            log_message(f"在 update_stats_and_state 中读/创建 {STATS_FILE} 失败: {e}. 使用默认值。")
-            stats = default_data
+        stats = await read_stats_unlocked()
 
         # --- 2. 直接在锁内进行日期检查 ---
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -380,20 +558,7 @@ async def advance_round_robin_state_only(
 ):
     """仅推进配置项 round-robin 指针，不记录成功/失败，不影响熔断。用于图片 202 任务已被上游接收。"""
     async with file_lock:
-        default_data = get_default_stats()
-        stats = default_data
-        try:
-            if os.path.exists(STATS_FILE):
-                async with aiofiles.open(STATS_FILE, 'r', encoding='utf-8') as f:
-                    content = await f.read()
-                    if content:
-                        stats = json.loads(content)
-            else:
-                async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
-                    await f.write(json.dumps(default_data, indent=2))
-        except Exception as e:
-            log_message(f"在 advance_round_robin_state_only 中读/创建 {STATS_FILE} 失败: {e}. 使用默认值。")
-            stats = default_data
+        stats = await read_stats_unlocked()
 
         if "round_robin_state" not in stats:
             stats["round_robin_state"] = {}
@@ -412,19 +577,27 @@ async def advance_round_robin_state_only(
 
 # --- 4. 认证依赖 ---
 
-async def verify_key(authorization: str = Header(..., description="认证密钥，格式: Bearer YOUR_ADMIN_KEY")):
-    """依赖项：验证 ADMIN_KEY"""
+async def verify_key(
+        request: Request,
+        authorization: Optional[str] = Header(None, description="认证密钥，格式: Bearer YOUR_ADMIN_KEY")
+):
+    """依赖项：验证 ADMIN_KEY，并记录来源 IP 的认证成功/失败。"""
     if not ADMIN_KEY:
         log_message("!!! 严重错误: ADMIN_KEY 未设置, 所有请求都将失败 !!!")
+        await record_ip_auth_result(request, False, "ADMIN_KEY 未设置")
         raise HTTPException(status_code=500, detail="服务器内部错误: 认证未配置")
 
     if authorization != f"Bearer {ADMIN_KEY}":
         log_message(f"认证失败: 提供的 Key {authorization} 不正确")
+        await record_ip_auth_result(request, False, "OpenAI/Admin Authorization 不匹配")
         raise HTTPException(status_code=401, detail="无效的认证密钥")
+
+    await record_ip_auth_result(request, True)
     return True
 
 
 async def verify_anthropic_key(
+        request: Request,
         authorization: Optional[str] = Header(None, description="兼容 Bearer YOUR_ADMIN_KEY"),
         x_api_key: Optional[str] = Header(None, alias="x-api-key", description="Anthropic 风格 API Key"),
         anthropic_version: Optional[str] = Header(None, alias="anthropic-version", description="Anthropic API 版本，仅兼容读取")
@@ -432,13 +605,17 @@ async def verify_anthropic_key(
     """Anthropic 入口鉴权：同时支持 Authorization: Bearer ADMIN_KEY 与 x-api-key: ADMIN_KEY。"""
     if not ADMIN_KEY:
         log_message("!!! 严重错误: ADMIN_KEY 未设置, 所有请求都将失败 !!!")
+        await record_ip_auth_result(request, False, "ADMIN_KEY 未设置")
         raise HTTPException(status_code=500, detail="服务器内部错误: 认证未配置")
 
     bearer_ok = authorization == f"Bearer {ADMIN_KEY}"
     x_key_ok = x_api_key == ADMIN_KEY
     if not bearer_ok and not x_key_ok:
         log_message("Anthropic 入口认证失败: Authorization/x-api-key 均不匹配")
+        await record_ip_auth_result(request, False, "Anthropic Authorization/x-api-key 均不匹配")
         raise HTTPException(status_code=401, detail="无效的认证密钥")
+
+    await record_ip_auth_result(request, True)
     return True
 
 
@@ -1779,7 +1956,7 @@ async def get_statistics():
 @admin_router.post("/stats/config/{config_id}/unblock")
 async def unblock_config(config_id: str):
     """手动解除指定配置项的熔断禁用状态。"""
-    stats = await read_json_file(STATS_FILE, get_default_stats())
+    stats = normalize_stats_structure(await read_json_file(STATS_FILE, get_default_stats()))
     config_stats = stats.get("by_config_id", {}).get(config_id)
     if not isinstance(config_stats, dict):
         raise HTTPException(status_code=404, detail="未找到该配置项的统计记录")
@@ -1797,6 +1974,32 @@ async def unblock_config(config_id: str):
         log_message(f"管理: 手动解除配置项 {config_id} 的熔断禁用状态")
 
     return {"ok": True, "config_id": config_id, "changed": changed}
+
+
+@admin_router.post("/stats/ip/{ip}/unblock")
+async def unblock_ip(ip: str):
+    """手动解除指定 IP 的封禁状态。"""
+    stats = normalize_stats_structure(await read_json_file(STATS_FILE, get_default_stats()))
+    ip_stats = stats.get("by_ip", {}).get(ip)
+    if not isinstance(ip_stats, dict):
+        raise HTTPException(status_code=404, detail="未找到该 IP 的统计记录")
+
+    changed = False
+    if ip_stats.get("is_banned"):
+        ip_stats["is_banned"] = False
+        changed = True
+    if ip_stats.get("banned_at") is not None:
+        ip_stats["banned_at"] = None
+        changed = True
+    if ip_stats.get("consecutive_fails", 0) != 0:
+        ip_stats["consecutive_fails"] = 0
+        changed = True
+
+    if changed:
+        await write_json_file(STATS_FILE, stats)
+        log_message(f"管理: 手动解除 IP {ip} 的封禁状态")
+
+    return {"ok": True, "ip": ip, "changed": changed}
 
 
 @admin_router.get("/logs")

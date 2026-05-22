@@ -969,6 +969,101 @@ html[data-theme="claude"] .stat-card::after {
     margin: 0.5rem 0 0;
 }
 
+.stats-sections {
+    display: grid;
+    gap: 1rem;
+    margin-top: 1.5rem;
+}
+
+.stats-collapse-card {
+    border: 1px solid var(--theme-border);
+    border-radius: var(--radius-lg);
+    background: var(--theme-surface-soft);
+    box-shadow: var(--theme-shadow-soft);
+    overflow: hidden;
+}
+
+.stats-collapse-card summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 1rem 1.1rem;
+    cursor: pointer;
+    list-style: none;
+    color: var(--color-text);
+    font-weight: 850;
+}
+
+.stats-collapse-card summary::-webkit-details-marker {
+    display: none;
+}
+
+.stats-collapse-card summary::after {
+    content: "展开";
+    flex: 0 0 auto;
+    padding: 0.32rem 0.62rem;
+    border: 1px solid var(--theme-border);
+    border-radius: var(--radius-pill);
+    background: var(--theme-surface);
+    color: var(--color-primary);
+    font-size: 0.78rem;
+    font-weight: 850;
+}
+
+.stats-collapse-card[open] summary::after {
+    content: "收起";
+}
+
+.stats-collapse-card summary span {
+    font-size: 1.02rem;
+}
+
+.stats-collapse-card summary small {
+    margin-left: auto;
+    color: var(--color-text-light);
+    font-weight: 600;
+}
+
+.stats-collapse-card .table-container {
+    margin: 0 1rem 1rem;
+}
+
+.status-cell {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.28rem;
+}
+
+.status-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: max-content;
+    padding: 0.22rem 0.55rem;
+    border-radius: var(--radius-pill);
+    font-size: 0.76rem;
+    font-weight: 900;
+    white-space: nowrap;
+}
+
+.status-badge-ok {
+    color: var(--color-success);
+    background: color-mix(in srgb, var(--color-success) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--color-success) 28%, transparent);
+}
+
+.status-badge-danger {
+    color: var(--color-danger);
+    background: color-mix(in srgb, var(--color-danger) 13%, transparent);
+    border: 1px solid color-mix(in srgb, var(--color-danger) 28%, transparent);
+}
+
+.ip-banned-row td {
+    background: color-mix(in srgb, var(--color-danger) 7%, transparent);
+}
+
 /* --- 9. 日志 --- */
 .log-settings-row {
     display: flex;
@@ -1118,7 +1213,8 @@ html[data-theme="claude"] .stat-card::after {
 td .edit-btn,
 td .copy-btn,
 td .delete-btn,
-td .unblock-config-btn {
+td .unblock-config-btn,
+td .unblock-ip-btn {
     padding: 0.36rem 0.62rem;
     font-size: 0.82rem;
     margin-right: 0.25rem;
@@ -1607,6 +1703,19 @@ html[data-theme="deepseek"] .ambient-deepseek {
     .model-dropdown-wrap,
     .injected-message-row {
         grid-template-columns: 1fr;
+    }
+
+    .stats-collapse-card summary {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .stats-collapse-card summary small {
+        margin-left: 0;
+    }
+
+    .stats-collapse-card .table-container {
+        margin: 0 0.65rem 0.65rem;
     }
 
     .log-settings-row {

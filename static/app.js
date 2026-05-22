@@ -63,6 +63,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const statTodayFail = document.getElementById("stat-today-fail");
     const statsByConfigBody = document.getElementById("stats-by-config-body");
     const statsTodayByConfigBody = document.getElementById("stats-today-by-config-body"); // 新增
+    const statsByIpBody = document.getElementById("stats-by-ip-body");
 
     // 日志 Tab
     const logsContent = document.getElementById("logs-content");
@@ -191,6 +192,12 @@ document.addEventListener("DOMContentLoaded", () => {
         themeOptions.forEach(option => {
             option.addEventListener("click", () => applyTheme(option.dataset.themeOption));
         });
+    }
+
+    function escapeHtml(value) {
+        const div = document.createElement("div");
+        div.textContent = String(value ?? "");
+        return div.innerHTML;
     }
 
     function maskApiKey(apiKey) {
@@ -456,6 +463,8 @@ document.addEventListener("DOMContentLoaded", () => {
             renderStatsTable(statsByConfigBody, allConfigsFlat, stats.by_config_id, true);
             // 渲染今日统计
             renderStatsTable(statsTodayByConfigBody, allConfigsFlat, stats.today.by_config_id, false);
+            // 渲染 IP 请求与封禁统计
+            renderIpStatsTable(statsByIpBody, stats.by_ip || {});
 
         } catch (err) {
             console.error("加载统计失败:", err);
@@ -496,6 +505,56 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     }
 
+    function formatDateTime(value) {
+        if (!value) return "-";
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return String(value);
+        return date.toLocaleString();
+    }
+
+    function renderIpStatsTable(tbody, ipStatsData) {
+        if (!tbody) return;
+        tbody.innerHTML = "";
+        const entries = Object.entries(ipStatsData || {}).sort((a, b) => {
+            const aBanned = a[1]?.is_banned ? 1 : 0;
+            const bBanned = b[1]?.is_banned ? 1 : 0;
+            if (aBanned !== bBanned) return bBanned - aBanned;
+            const aSeen = new Date(a[1]?.last_seen_at || 0).getTime() || 0;
+            const bSeen = new Date(b[1]?.last_seen_at || 0).getTime() || 0;
+            return bSeen - aSeen;
+        });
+
+        if (entries.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="9">暂无 IP 请求统计</td></tr>`;
+            return;
+        }
+
+        entries.forEach(([ip, stat]) => {
+            const isBanned = !!stat?.is_banned;
+            const tr = document.createElement("tr");
+            tr.classList.toggle("ip-banned-row", isBanned);
+            const safeIp = escapeHtml(ip);
+            const statusBadge = isBanned
+                ? `<span class="status-badge status-badge-danger">已封禁</span><small>${escapeHtml(formatDateTime(stat.banned_at))}</small>`
+                : `<span class="status-badge status-badge-ok">正常</span>`;
+            const actionButton = isBanned
+                ? `<button type="button" class="button button-secondary unblock-ip-btn" data-ip="${safeIp}">解除封禁</button>`
+                : '<em>-</em>';
+            tr.innerHTML = `
+                <td><small>${safeIp}</small></td>
+                <td>${stat?.total || 0}</td>
+                <td class="success-text">${stat?.success || 0}</td>
+                <td class="fail-text">${stat?.fail || 0}</td>
+                <td>${stat?.consecutive_fails || 0}</td>
+                <td><div class="status-cell">${statusBadge}</div></td>
+                <td><small>${escapeHtml(formatDateTime(stat?.last_seen_at))}</small></td>
+                <td><small>${escapeHtml(stat?.last_fail_reason || "-")}</small></td>
+                <td>${actionButton}</td>
+            `;
+            tbody.appendChild(tr);
+        });
+    }
+
     async function unblockConfig(configId) {
         if (!configId) return;
         try {
@@ -511,6 +570,24 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch (err) {
             console.error("解除熔断失败:", err);
             alert(`解除禁用失败: ${err.message}`);
+        }
+    }
+
+    async function unblockIp(ip) {
+        if (!ip) return;
+        try {
+            const response = await authedFetch(`/admin/stats/ip/${encodeURIComponent(ip)}/unblock`, {
+                method: "POST"
+            });
+            if (!response) return;
+            if (!response.ok) {
+                const text = await response.text();
+                throw new Error(text || `HTTP ${response.status}`);
+            }
+            await loadStats();
+        } catch (err) {
+            console.error("解除 IP 封禁失败:", err);
+            alert(`解除 IP 封禁失败: ${err.message}`);
         }
     }
 
@@ -1142,6 +1219,16 @@ document.addEventListener("DOMContentLoaded", () => {
             button.textContent = "解除中...";
             await unblockConfig(button.dataset.configId);
         });
+
+        if (statsByIpBody) {
+            statsByIpBody.addEventListener("click", async (e) => {
+                const button = e.target.closest(".unblock-ip-btn");
+                if (!button) return;
+                button.disabled = true;
+                button.textContent = "解除中...";
+                await unblockIp(button.dataset.ip);
+            });
+        }
 
         configForm.addEventListener("submit", handleFormSubmit);
         cancelButton.addEventListener("click", resetForm);

@@ -342,42 +342,80 @@
                     </div>
                 </div>
 
-                <h3 class="mt-2">按配置统计 (历史总计)</h3>
-                <div class="table-container">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>URL</th>
-                                <th class="success-text">成功</th>
-                                <th class="fail-text">失败</th>
-                                <th>连续失败</th>
-                                <th>禁用至</th>
-                                <th>操作</th>
-                            </tr>
-                        </thead>
-                        <tbody id="stats-by-config-body">
-                            <tr><td colspan="7">加载中...</td></tr>
-                        </tbody>
-                    </table>
-                </div>
+                <div class="stats-sections">
+                    <details class="stats-collapse-card" open>
+                        <summary>
+                            <span>按配置统计 (历史总计)</span>
+                            <small>成功 / 失败 / 连续失败 / 熔断状态</small>
+                        </summary>
+                        <div class="table-container">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>ID</th>
+                                        <th>URL</th>
+                                        <th class="success-text">成功</th>
+                                        <th class="fail-text">失败</th>
+                                        <th>连续失败</th>
+                                        <th>禁用至</th>
+                                        <th>操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="stats-by-config-body">
+                                    <tr><td colspan="7">加载中...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </details>
 
-                <!-- [新增] 今日按配置统计表格 -->
-                <h3 class="mt-2">按配置统计 (今日)</h3>
-                <div class="table-container">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>URL</th>
-                                <th class="success-text">成功</th>
-                                <th class="fail-text">失败</th>
-                            </tr>
-                        </thead>
-                        <tbody id="stats-today-by-config-body">
-                            <tr><td colspan="4">加载中...</td></tr>
-                        </tbody>
-                    </table>
+                    <details class="stats-collapse-card">
+                        <summary>
+                            <span>按配置统计 (今日)</span>
+                            <small>每日自动重置的配置请求计数</small>
+                        </summary>
+                        <div class="table-container">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>ID</th>
+                                        <th>URL</th>
+                                        <th class="success-text">成功</th>
+                                        <th class="fail-text">失败</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="stats-today-by-config-body">
+                                    <tr><td colspan="4">加载中...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </details>
+
+                    <details class="stats-collapse-card">
+                        <summary>
+                            <span>IP 请求与封禁统计</span>
+                            <small>连续 5 次认证失败自动封禁，需手动解除</small>
+                        </summary>
+                        <div class="table-container">
+                            <table>
+                                <thead>
+                                    <tr>
+                                        <th>IP</th>
+                                        <th>总请求</th>
+                                        <th class="success-text">成功</th>
+                                        <th class="fail-text">失败</th>
+                                        <th>连续失败</th>
+                                        <th>封禁状态</th>
+                                        <th>最后访问</th>
+                                        <th>最后失败原因</th>
+                                        <th>操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="stats-by-ip-body">
+                                    <tr><td colspan="9">加载中...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </details>
                 </div>
             </section>
 
