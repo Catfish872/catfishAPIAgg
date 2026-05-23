@@ -9,7 +9,9 @@ import aiofiles
 import json
 import uuid
 import ipaddress
-from datetime import datetime, timedelta
+import copy
+import time
+from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Dict, Literal
 from itertools import groupby
@@ -58,6 +60,15 @@ GENERATED_IMAGES_DIR = os.path.join(DATA_DIR, "generated_images")
 GENERATED_IMAGES_ROUTE = "/generated-images"
 # IP 连续认证失败自动封禁阈值；封禁后需在控制台手动解除
 IP_FAILURE_BAN_THRESHOLD = 5
+# 明细数据保留期：累计请求数量长期保留，路径明细和生成图片按 1 个月清理
+DETAIL_RETENTION_DAYS = 30
+DETAIL_RETENTION_SECONDS = DETAIL_RETENTION_DAYS * 24 * 60 * 60
+# 单个 IP 最多保留的路径明细数量，避免 stats.json 因资源路径无限增长
+MAX_IP_PATH_STATS = 200
+# 普通统计写盘节流间隔；关键事件仍会强制刷新
+STATS_FLUSH_INTERVAL_SECONDS = 10
+# 生成图片后台清理间隔
+GENERATED_IMAGE_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
 
 # 确保数据目录存在
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -71,6 +82,16 @@ show_full_response_body = False
 
 # 异步文件读写锁
 file_lock = asyncio.Lock()
+# 配置与统计缓存锁：高频请求路径优先读写内存，减少磁盘读盘/写盘压力
+config_lock = asyncio.Lock()
+stats_lock = asyncio.Lock()
+config_cache: Optional[Dict[str, List[dict]]] = None
+stats_cache: Optional[dict] = None
+stats_dirty = False
+stats_last_flush_monotonic = 0.0
+stats_last_path_cleanup_date: Optional[str] = None
+generated_image_cleanup_task: Optional[asyncio.Task] = None
+stats_flush_task: Optional[asyncio.Task] = None
 
 # 全局 httpx 客户端 (用于连接池)
 # 设置一个合理的超时时间，例如 300 秒，兼容耗时较长的同步生图请求
@@ -174,9 +195,38 @@ CLAUDE_CODE_USER_AGENT = "claude-cli/2.1.63 (external, cli)"
 SILLYTAVERN_USER_AGENT = "node-fetch"
 
 
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def beijing_now() -> datetime:
+    """返回明确的北京时间，避免容器/服务器默认 UTC 导致统计日期偏移。"""
+    return datetime.now(BEIJING_TZ)
+
+
+def beijing_date_str() -> str:
+    return beijing_now().strftime("%Y-%m-%d")
+
+
+def beijing_isoformat() -> str:
+    return beijing_now().isoformat()
+
+
+def parse_stats_datetime(value: Any) -> Optional[datetime]:
+    """兼容旧版无时区 ISO 字符串；无时区时按北京时间解释。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=BEIJING_TZ)
+        return parsed.astimezone(BEIJING_TZ)
+    except Exception:
+        return None
+
+
 def log_message(message: str):
     """向内存日志队列中添加一条日志"""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
     log_deque.append(f"[{now}] {message}")
     print(message)  # 同时也打印到控制台
 
@@ -212,52 +262,196 @@ async def write_json_file(file_path: str, data: Any):
             log_message(f"写入 JSON 文件 {file_path} 失败: {e}")
 
 
-# 配置相关的 I/O
-async def get_all_schemes() -> Dict[str, List[ApiConfig]]:
-    """获取所有方案及其 API 配置"""
+# 配置相关的 I/O 与缓存
+async def load_config_data_from_disk() -> Dict[str, List[dict]]:
+    """从磁盘读取配置并归一化；仅启动、缓存缺失或异常回退时使用。"""
     configs_data = await read_json_file(CONFIG_FILE, {})
+    changed = False
 
-    # [新增] 向后兼容逻辑：如果读到的是列表（旧格式），自动转换为带 "default" 方案的字典
     if isinstance(configs_data, list):
         log_message("检测到旧版配置文件格式（列表），自动迁移到方案格式 `{'default': ...}`")
         configs_data = {"default": configs_data}
-        # 将迁移后的结果写回文件
-        await write_json_file(CONFIG_FILE, configs_data)
+        changed = True
 
-    schemes = {}
+    if not isinstance(configs_data, dict):
+        configs_data = {}
+        changed = True
+
+    normalized: Dict[str, List[dict]] = {}
+    for scheme_name, configs_list in configs_data.items():
+        if not isinstance(configs_list, list):
+            continue
+        normalized[str(scheme_name)] = [item for item in configs_list if isinstance(item, dict)]
+
+    if changed:
+        await write_json_file(CONFIG_FILE, normalized)
+
+    return normalized
+
+
+def build_scheme_models(configs_data: Dict[str, List[dict]]) -> Dict[str, List[ApiConfig]]:
+    schemes: Dict[str, List[ApiConfig]] = {}
     for scheme_name, configs_list in configs_data.items():
         configs = [ApiConfig(**data) for data in configs_list]
-        # 优先级数字越小越靠前
         configs.sort(key=lambda x: x.priority)
         schemes[scheme_name] = configs
-
     return schemes
 
 
+async def get_config_cache_data() -> Dict[str, List[dict]]:
+    """获取配置缓存；普通代理请求不再每次读盘。"""
+    global config_cache
+    async with config_lock:
+        if config_cache is None:
+            config_cache = await load_config_data_from_disk()
+        return copy.deepcopy(config_cache)
+
+
+async def refresh_config_cache() -> Dict[str, List[dict]]:
+    """强制从磁盘刷新配置缓存；仅启动或异常修复场景使用。"""
+    global config_cache
+    async with config_lock:
+        config_cache = await load_config_data_from_disk()
+        return copy.deepcopy(config_cache)
+
+
+async def get_all_schemes() -> Dict[str, List[ApiConfig]]:
+    """获取所有方案及其 API 配置；缓存优先，异常时回退一次磁盘读取。"""
+    try:
+        return build_scheme_models(await get_config_cache_data())
+    except Exception as e:
+        log_message(f"配置缓存读取失败，回退磁盘读取: {e}")
+        return build_scheme_models(await refresh_config_cache())
+
+
 async def save_all_schemes(schemes: Dict[str, List[ApiConfig]]):
-    """保存所有方案配置"""
+    """保存所有方案配置，并同步刷新内存缓存。"""
+    global config_cache
     schemes_data = {
         scheme_name: [config.dict() for config in configs]
         for scheme_name, configs in schemes.items()
     }
     await write_json_file(CONFIG_FILE, schemes_data)
+    async with config_lock:
+        config_cache = copy.deepcopy(schemes_data)
 
 
-# 统计相关的 I/O
+# 统计相关的 I/O、缓存与明细清理
 def get_default_stats():
-    """获取默认的统计数据结构"""
+    """获取默认的统计数据结构。"""
     return {
         "total": {"success": 0, "fail": 0},
         "today": {
-            "date": datetime.now().strftime("%Y-%m-%d"),
+            "date": beijing_date_str(),
             "success": 0,
             "fail": 0,
-            "by_config_id": {}  # [新增] 今日按配置统计
+            "by_config_id": {}
         },
         "by_config_id": {},
-        "round_robin_state": {},  # [新增] 轮询状态
-        "by_ip": {}  # IP 请求/认证统计与封禁状态
+        "round_robin_state": {},
+        "by_ip": {}
     }
+
+
+def normalize_request_path(path: Any) -> str:
+    """只记录 URL 路径，不记录查询参数。"""
+    if not isinstance(path, str) or not path.strip():
+        return "/"
+    normalized = path.strip().split("?", 1)[0] or "/"
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return normalized[:500]
+
+
+def normalize_path_stats_entry(entry: Any) -> dict:
+    if not isinstance(entry, dict):
+        entry = {}
+    entry.setdefault("total", 0)
+    entry.setdefault("success", 0)
+    entry.setdefault("fail", 0)
+    entry.setdefault("last_seen_at", None)
+    entry.setdefault("last_success_at", None)
+    entry.setdefault("last_fail_at", None)
+    entry.setdefault("last_fail_reason", None)
+    return entry
+
+
+def ensure_ip_stats_entry(stats: dict, ip: str) -> dict:
+    """确保 IP 统计项存在并补齐字段。"""
+    by_ip = stats.setdefault("by_ip", {})
+    entry = by_ip.setdefault(ip, {})
+    entry.setdefault("total", 0)
+    entry.setdefault("success", 0)
+    entry.setdefault("fail", 0)
+    entry.setdefault("consecutive_fails", 0)
+    entry.setdefault("is_banned", False)
+    entry.setdefault("banned_at", None)
+    entry.setdefault("last_seen_at", None)
+    entry.setdefault("last_success_at", None)
+    entry.setdefault("last_fail_at", None)
+    entry.setdefault("last_fail_reason", None)
+    if not isinstance(entry.get("paths"), dict):
+        entry["paths"] = {}
+    return entry
+
+
+def ensure_ip_path_entry(ip_entry: dict, path: str) -> dict:
+    paths = ip_entry.setdefault("paths", {})
+    if not isinstance(paths, dict):
+        paths = {}
+        ip_entry["paths"] = paths
+    normalized_path = normalize_request_path(path)
+    path_entry = normalize_path_stats_entry(paths.setdefault(normalized_path, {}))
+    paths[normalized_path] = path_entry
+    return path_entry
+
+
+def prune_ip_paths(ip_entry: dict, now_dt: Optional[datetime] = None) -> bool:
+    """清理单个 IP 下超过 1 个月或超出数量上限的路径明细；累计计数不受影响。"""
+    paths = ip_entry.get("paths")
+    if not isinstance(paths, dict) or not paths:
+        ip_entry["paths"] = {}
+        return False
+
+    now_dt = now_dt or beijing_now()
+    cutoff = now_dt - timedelta(seconds=DETAIL_RETENTION_SECONDS)
+    changed = False
+
+    for path, path_entry in list(paths.items()):
+        normalized_entry = normalize_path_stats_entry(path_entry)
+        paths[path] = normalized_entry
+        last_seen = parse_stats_datetime(normalized_entry.get("last_seen_at"))
+        if last_seen and last_seen < cutoff:
+            del paths[path]
+            changed = True
+
+    if len(paths) > MAX_IP_PATH_STATS:
+        sorted_items = sorted(
+            paths.items(),
+            key=lambda item: (parse_stats_datetime(item[1].get("last_seen_at")) or datetime.min.replace(tzinfo=BEIJING_TZ)),
+            reverse=True
+        )
+        kept = dict(sorted_items[:MAX_IP_PATH_STATS])
+        if len(kept) != len(paths):
+            ip_entry["paths"] = kept
+            changed = True
+
+    return changed
+
+
+def prune_expired_path_details(stats: dict, force: bool = False) -> bool:
+    """按天轻量清理路径明细，避免每次请求都全量扫描。"""
+    global stats_last_path_cleanup_date
+    today = beijing_date_str()
+    if not force and stats_last_path_cleanup_date == today:
+        return False
+
+    changed = False
+    for entry in stats.get("by_ip", {}).values():
+        if isinstance(entry, dict):
+            changed = prune_ip_paths(entry, beijing_now()) or changed
+    stats_last_path_cleanup_date = today
+    return changed
 
 
 def normalize_stats_structure(stats: Any) -> dict:
@@ -285,33 +479,125 @@ def normalize_stats_structure(stats: Any) -> dict:
         stats["round_robin_state"] = {}
     if not isinstance(stats.get("by_ip"), dict):
         stats["by_ip"] = {}
+    for ip, entry in list(stats["by_ip"].items()):
+        if not isinstance(entry, dict):
+            del stats["by_ip"][ip]
+            continue
+        ensure_ip_stats_entry(stats, ip)
+        prune_ip_paths(entry, beijing_now())
 
     return stats
+
+
+async def load_stats_from_disk() -> dict:
+    default_data = get_default_stats()
+    stats = default_data
+    try:
+        async with file_lock:
+            if os.path.exists(STATS_FILE):
+                async with aiofiles.open(STATS_FILE, 'r', encoding='utf-8') as f:
+                    content = await f.read()
+                    if content:
+                        stats = json.loads(content)
+            else:
+                async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
+                    await f.write(json.dumps(default_data, indent=2, ensure_ascii=False))
+    except Exception as e:
+        log_message(f"读取/创建 {STATS_FILE} 失败: {e}. 使用默认值。")
+        stats = default_data
+    return normalize_stats_structure(stats)
+
+
+async def write_stats_to_disk(stats: dict):
+    async with file_lock:
+        async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(stats, indent=2, ensure_ascii=False))
+
+
+async def flush_stats_if_needed(force: bool = False):
+    """将内存统计节流落盘；关键安全事件可 force=True。"""
+    global stats_dirty, stats_last_flush_monotonic
+    async with stats_lock:
+        if stats_cache is None:
+            return
+        if not stats_dirty and not force:
+            return
+        now_mono = time.monotonic()
+        if not force and now_mono - stats_last_flush_monotonic < STATS_FLUSH_INTERVAL_SECONDS:
+            return
+        snapshot = copy.deepcopy(stats_cache)
+        stats_dirty = False
+        stats_last_flush_monotonic = now_mono
+
+    try:
+        await write_stats_to_disk(snapshot)
+    except Exception as e:
+        async with stats_lock:
+            stats_dirty = True
+        log_message(f"写入 {STATS_FILE} 失败: {e}")
+
+
+async def mark_stats_dirty(force_flush: bool = False):
+    """标记统计缓存已变更；可在 stats_lock 内部调用，不能再次获取同一把锁。"""
+    global stats_dirty
+    stats_dirty = True
+    if force_flush:
+        await flush_stats_if_needed(force=True)
+
+
+def reset_today_if_needed_unlocked(stats: dict) -> bool:
+    today_str = beijing_date_str()
+    if stats.get("today", {}).get("date") == today_str:
+        return False
+    stats["today"] = {
+        "date": today_str,
+        "success": 0,
+        "fail": 0,
+        "by_config_id": {}
+    }
+    return True
+
+
+async def init_stats_cache() -> dict:
+    global stats_cache, stats_dirty
+    async with stats_lock:
+        stats_cache = await load_stats_from_disk()
+        changed = reset_today_if_needed_unlocked(stats_cache)
+        changed = prune_expired_path_details(stats_cache, force=True) or changed
+        stats_dirty = stats_dirty or changed
+        snapshot = copy.deepcopy(stats_cache)
+    if changed:
+        await flush_stats_if_needed(force=True)
+    return snapshot
 
 
 async def get_stats() -> dict:
-    """获取统计数据，并处理日期重置"""
-    stats = normalize_stats_structure(await read_json_file(STATS_FILE, get_default_stats()))
+    """获取统计数据；缓存优先，避免统计页轮询反复读盘。"""
+    global stats_cache, stats_dirty
+    async with stats_lock:
+        if stats_cache is None:
+            stats_cache = await load_stats_from_disk()
+        changed = reset_today_if_needed_unlocked(stats_cache)
+        changed = prune_expired_path_details(stats_cache) or changed
+        stats_dirty = stats_dirty or changed
+        snapshot = copy.deepcopy(stats_cache)
+    if changed:
+        await flush_stats_if_needed()
+    return snapshot
 
-    # 检查日期是否是今天，如果不是，重置 today 并更新日期
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    if stats.get("today", {}).get("date") != today_str:
-        stats["today"] = {
-            "date": today_str,
-            "success": 0,
-            "fail": 0,
-            "by_config_id": {}  # [新增] 重置今日按配置统计
-        }
 
-        # 清理不存在的 config (保留原有逻辑)
-        all_schemes = await get_all_schemes()
-        config_ids = {c.id for scheme in all_schemes.values() for c in scheme}
-        stats["by_config_id"] = {
-            cid: data for cid, data in stats.get("by_config_id", {}).items() if cid in config_ids
-        }
-        await write_json_file(STATS_FILE, stats)
+async def read_stats_unlocked() -> dict:
+    """兼容旧调用名：返回内存统计快照，不再高频读盘。"""
+    return await get_stats()
 
-    return stats
+
+async def write_stats_unlocked(stats: dict):
+    """兼容旧调用名：更新内存缓存并节流落盘。"""
+    global stats_cache, stats_dirty
+    async with stats_lock:
+        stats_cache = normalize_stats_structure(stats)
+        stats_dirty = True
+    await flush_stats_if_needed()
 
 
 def normalize_ip_candidate(value: Optional[str]) -> Optional[str]:
@@ -322,7 +608,6 @@ def normalize_ip_candidate(value: Optional[str]) -> Optional[str]:
     if not candidate:
         return None
 
-    # 兼容 IPv4:port；IPv6 不在这里按冒号切分，避免破坏 IPv6 字面量。
     if candidate.count(":") == 1 and "." in candidate:
         candidate = candidate.rsplit(":", 1)[0]
 
@@ -362,104 +647,82 @@ def is_admin_authorization_valid(request: Request) -> bool:
     return authorization == f"Bearer {ADMIN_KEY}" or x_api_key == ADMIN_KEY
 
 
-async def read_stats_unlocked() -> dict:
-    """仅在已持有 file_lock 时调用：读取并归一化 stats。"""
-    default_data = get_default_stats()
-    stats = default_data
-    try:
-        if os.path.exists(STATS_FILE):
-            async with aiofiles.open(STATS_FILE, 'r', encoding='utf-8') as f:
-                content = await f.read()
-                if content:
-                    stats = json.loads(content)
-        else:
-            async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
-                await f.write(json.dumps(default_data, indent=2, ensure_ascii=False))
-    except Exception as e:
-        log_message(f"读取/创建 {STATS_FILE} 失败: {e}. 使用默认值。")
-        stats = default_data
-    return normalize_stats_structure(stats)
-
-
-async def write_stats_unlocked(stats: dict):
-    """仅在已持有 file_lock 时调用：写入 stats。"""
-    async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
-        await f.write(json.dumps(stats, indent=2, ensure_ascii=False))
-
-
 async def get_ip_stats_entry(ip: str) -> Optional[dict]:
-    """读取指定 IP 的统计项。"""
+    """读取指定 IP 的统计项；缓存优先。"""
     stats = await get_stats()
     entry = stats.get("by_ip", {}).get(ip)
     return entry if isinstance(entry, dict) else None
 
 
-def ensure_ip_stats_entry(stats: dict, ip: str) -> dict:
-    """确保 IP 统计项存在并补齐字段。"""
-    by_ip = stats.setdefault("by_ip", {})
-    entry = by_ip.setdefault(ip, {})
-    entry.setdefault("total", 0)
-    entry.setdefault("success", 0)
-    entry.setdefault("fail", 0)
-    entry.setdefault("consecutive_fails", 0)
-    entry.setdefault("is_banned", False)
-    entry.setdefault("banned_at", None)
-    entry.setdefault("last_seen_at", None)
-    entry.setdefault("last_success_at", None)
-    entry.setdefault("last_fail_at", None)
-    entry.setdefault("last_fail_reason", None)
-    return entry
-
-
-async def record_ip_request_seen(ip: str):
-    """在全局中间件中记录每一次进入服务的请求 IP。"""
-    now_str = datetime.now().isoformat()
-    async with file_lock:
-        stats = await read_stats_unlocked()
+async def record_ip_request_seen(ip: str, path: str = "/"):
+    """在全局中间件中记录每一次进入服务的请求 IP 和路径；仅更新内存并节流落盘。"""
+    now_str = beijing_isoformat()
+    normalized_path = normalize_request_path(path)
+    async with stats_lock:
+        if stats_cache is None:
+            current_stats = await load_stats_from_disk()
+            globals()["stats_cache"] = current_stats
+        stats = stats_cache
+        reset_today_if_needed_unlocked(stats)
         entry = ensure_ip_stats_entry(stats, ip)
         entry["total"] = int(entry.get("total", 0) or 0) + 1
         entry["last_seen_at"] = now_str
-        try:
-            await write_stats_unlocked(stats)
-        except Exception as e:
-            log_message(f"写入 IP 请求统计失败: {e}")
+        path_entry = ensure_ip_path_entry(entry, normalized_path)
+        path_entry["total"] = int(path_entry.get("total", 0) or 0) + 1
+        path_entry["last_seen_at"] = now_str
+        prune_ip_paths(entry, beijing_now())
+        await mark_stats_dirty(False)
+    await flush_stats_if_needed()
 
 
 async def record_ip_auth_result(request: Request, is_success: bool, reason: str = ""):
     """记录认证成功/失败；连续失败达到阈值后永久封禁，成功则清零连续失败。"""
     ip = get_client_ip(request)
-    now_str = datetime.now().isoformat()
+    path = normalize_request_path(request.url.path)
+    now_str = beijing_isoformat()
+    should_force_flush = False
 
-    async with file_lock:
-        stats = await read_stats_unlocked()
+    async with stats_lock:
+        if stats_cache is None:
+            current_stats = await load_stats_from_disk()
+            globals()["stats_cache"] = current_stats
+        stats = stats_cache
+        reset_today_if_needed_unlocked(stats)
         entry = ensure_ip_stats_entry(stats, ip)
         entry["last_seen_at"] = now_str
+        path_entry = ensure_ip_path_entry(entry, path)
 
         if is_success:
             entry["success"] = int(entry.get("success", 0) or 0) + 1
             entry["consecutive_fails"] = 0
             entry["last_success_at"] = now_str
+            path_entry["success"] = int(path_entry.get("success", 0) or 0) + 1
+            path_entry["last_success_at"] = now_str
         else:
             entry["fail"] = int(entry.get("fail", 0) or 0) + 1
             entry["consecutive_fails"] = int(entry.get("consecutive_fails", 0) or 0) + 1
             entry["last_fail_at"] = now_str
             entry["last_fail_reason"] = reason or "认证失败"
+            path_entry["fail"] = int(path_entry.get("fail", 0) or 0) + 1
+            path_entry["last_fail_at"] = now_str
+            path_entry["last_fail_reason"] = reason or "认证失败"
             if entry["consecutive_fails"] >= IP_FAILURE_BAN_THRESHOLD and not entry.get("is_banned"):
                 entry["is_banned"] = True
                 entry["banned_at"] = now_str
+                should_force_flush = True
                 log_message(f"IP 自动封禁: {ip} 连续认证失败 {entry['consecutive_fails']} 次，已永久封禁，需控制台手动解除")
 
-        try:
-            await write_stats_unlocked(stats)
-        except Exception as e:
-            log_message(f"写入 IP 统计失败: {e}")
+        prune_ip_paths(entry, beijing_now())
+        await mark_stats_dirty(False)
+    await flush_stats_if_needed(force=should_force_flush)
 
 
 @app.middleware("http")
 async def ip_ban_middleware(request: Request, call_next):
     """全局 IP 封禁拦截：覆盖所有路径；正确管理员密钥访问 IP 解封接口时允许穿透。"""
     ip = get_client_ip(request)
-    await record_ip_request_seen(ip)
+    request_path = normalize_request_path(request.url.path)
+    await record_ip_request_seen(ip, request_path)
     entry = await get_ip_stats_entry(ip)
     is_banned = bool(entry and entry.get("is_banned"))
 
@@ -481,41 +744,32 @@ async def update_stats_and_state(
         success_index_in_group: int,
         advance_round_robin: bool = True
 ):
-    """
-    [修复] 更新统计数据、熔断状态和轮询状态 (无死锁版本)
-    """
-    async with file_lock:
-        # --- 1. 直接在锁内进行无锁的文件读取 ---
-        stats = await read_stats_unlocked()
+    """更新统计数据、熔断状态和轮询状态；内存优先，普通事件节流落盘。"""
+    should_force_flush = False
+    async with stats_lock:
+        if stats_cache is None:
+            current_stats = await load_stats_from_disk()
+            globals()["stats_cache"] = current_stats
+        stats = stats_cache
+        reset_today_if_needed_unlocked(stats)
 
-        # --- 2. 直接在锁内进行日期检查 ---
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        if stats.get("today", {}).get("date") != today_str:
-            stats["today"] = {
-                "date": today_str,
-                "success": 0,
-                "fail": 0,
-                "by_config_id": {}
-            }
-
-        # --- 3. 更新统计数据 ---
         key = "success" if is_success else "fail"
-
         stats["total"][key] = stats["total"].get(key, 0) + 1
         stats["today"][key] = stats["today"].get(key, 0) + 1
 
-        if "by_config_id" not in stats: stats["by_config_id"] = {}
+        if "by_config_id" not in stats:
+            stats["by_config_id"] = {}
         if config.id not in stats["by_config_id"]:
             stats["by_config_id"][config.id] = {"success": 0, "fail": 0, "consecutive_fails": 0}
 
-        if "by_config_id" not in stats["today"]: stats["today"]["by_config_id"] = {}
+        if "by_config_id" not in stats["today"]:
+            stats["today"]["by_config_id"] = {}
         if config.id not in stats["today"]["by_config_id"]:
             stats["today"]["by_config_id"][config.id] = {"success": 0, "fail": 0}
 
         stats["by_config_id"][config.id][key] = stats["by_config_id"][config.id].get(key, 0) + 1
         stats["today"]["by_config_id"][config.id][key] = stats["today"]["by_config_id"][config.id].get(key, 0) + 1
 
-        # --- 4. 更新熔断状态 ---
         config_stats = stats["by_config_id"][config.id]
         if is_success:
             config_stats["consecutive_fails"] = 0
@@ -524,30 +778,24 @@ async def update_stats_and_state(
         else:
             current_fails = config_stats.get("consecutive_fails", 0) + 1
             config_stats["consecutive_fails"] = current_fails
-
             threshold = config.consecutive_failure_threshold
             duration = config.disable_duration_seconds
             if threshold is not None and duration is not None and current_fails >= threshold:
-                disabled_until_time = datetime.now() + timedelta(seconds=duration)
+                disabled_until_time = beijing_now() + timedelta(seconds=duration)
                 config_stats["disabled_until"] = disabled_until_time.isoformat()
-                log_message(
-                    f"熔断触发: 配置项 ID {config.id} 已被禁用，直到 {disabled_until_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                should_force_flush = True
+                log_message(f"熔断触发: 配置项 ID {config.id} 已被禁用，直到 {disabled_until_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # --- 5. 仅在成功且允许时更新配置项轮询状态 ---
         if is_success and advance_round_robin:
-            if "round_robin_state" not in stats: stats["round_robin_state"] = {}
+            if "round_robin_state" not in stats:
+                stats["round_robin_state"] = {}
             if scheme_name not in stats["round_robin_state"]:
                 stats["round_robin_state"][scheme_name] = {}
-
             next_index = (success_index_in_group + 1) % len(priority_group) if priority_group else 0
             stats["round_robin_state"][scheme_name][str(config.priority)] = next_index
 
-        # --- 6. 直接在锁内进行无锁的文件写入 ---
-        try:
-            async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
-                await f.write(json.dumps(stats, indent=2, ensure_ascii=False))
-        except Exception as e:
-            log_message(f"在 update_stats_and_state 中写入 {STATS_FILE} 失败: {e}")
+        await mark_stats_dirty(False)
+    await flush_stats_if_needed(force=should_force_flush)
 
 
 async def advance_round_robin_state_only(
@@ -557,22 +805,19 @@ async def advance_round_robin_state_only(
         success_index_in_group: int
 ):
     """仅推进配置项 round-robin 指针，不记录成功/失败，不影响熔断。用于图片 202 任务已被上游接收。"""
-    async with file_lock:
-        stats = await read_stats_unlocked()
-
+    async with stats_lock:
+        if stats_cache is None:
+            current_stats = await load_stats_from_disk()
+            globals()["stats_cache"] = current_stats
+        stats = stats_cache
         if "round_robin_state" not in stats:
             stats["round_robin_state"] = {}
         if scheme_name not in stats["round_robin_state"]:
             stats["round_robin_state"][scheme_name] = {}
-
         next_index = (success_index_in_group + 1) % len(priority_group) if priority_group else 0
         stats["round_robin_state"][scheme_name][str(config.priority)] = next_index
-
-        try:
-            async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
-                await f.write(json.dumps(stats, indent=2, ensure_ascii=False))
-        except Exception as e:
-            log_message(f"在 advance_round_robin_state_only 中写入 {STATS_FILE} 失败: {e}")
+        await mark_stats_dirty(False)
+    await flush_stats_if_needed()
 
 
 # --- 4. 认证依赖 ---
@@ -1022,10 +1267,10 @@ async def resolve_images_response_with_auto_poll(
     waiting_statuses = {"queued", "pending", "running", "processing", "in_progress", "created", "accepted"}
     failure_statuses = {"failed", "failure", "error", "cancelled", "canceled", "refunded", "expired"}
 
-    deadline = datetime.now() + timedelta(seconds=timeout_seconds)
+    deadline = beijing_now() + timedelta(seconds=timeout_seconds)
     poll_count = 0
     last_payload: Any = payload
-    while datetime.now() < deadline:
+    while beijing_now() < deadline:
         await ensure_client_connected()
         await asyncio.sleep(interval_seconds)
         await ensure_client_connected()
@@ -1162,7 +1407,7 @@ def convert_sse_bytes_to_non_stream_json(sse_bytes: bytes) -> Dict[str, Any]:
     result = {
         "id": first_obj.get("id") or f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
-        "created": first_obj.get("created") if isinstance(first_obj.get("created"), int) else int(datetime.now().timestamp()),
+        "created": first_obj.get("created") if isinstance(first_obj.get("created"), int) else int(beijing_now().timestamp()),
         "model": first_obj.get("model"),
         "choices": output_choices
     }
@@ -1218,7 +1463,7 @@ async def proxy_chat_completions(
 
     # --- 2. 构建尝试队列 (熔断、轮询) ---
     stats = await get_stats()
-    now_time = datetime.now()
+    now_time = beijing_now()
 
     # 过滤掉被熔断的配置
     active_configs = []
@@ -1226,8 +1471,8 @@ async def proxy_chat_completions(
         config_stats = stats.get("by_config_id", {}).get(config.id, {})
         disabled_until_str = config_stats.get("disabled_until")
         if disabled_until_str:
-            disabled_until_time = datetime.fromisoformat(disabled_until_str)
-            if now_time < disabled_until_time:
+            disabled_until_time = parse_stats_datetime(disabled_until_str)
+            if disabled_until_time and now_time < disabled_until_time:
                 log_message(f"配置项 ID: {config.id} 当前被熔断禁用，跳过。")
                 continue
         active_configs.append(config)
@@ -1955,22 +2200,27 @@ async def get_statistics():
 
 @admin_router.post("/stats/config/{config_id}/unblock")
 async def unblock_config(config_id: str):
-    """手动解除指定配置项的熔断禁用状态。"""
-    stats = normalize_stats_structure(await read_json_file(STATS_FILE, get_default_stats()))
-    config_stats = stats.get("by_config_id", {}).get(config_id)
-    if not isinstance(config_stats, dict):
-        raise HTTPException(status_code=404, detail="未找到该配置项的统计记录")
-
+    """手动解除指定配置项的熔断禁用状态；关键事件强制刷新到磁盘。"""
     changed = False
-    if "disabled_until" in config_stats:
-        del config_stats["disabled_until"]
-        changed = True
-    if config_stats.get("consecutive_fails", 0) != 0:
-        config_stats["consecutive_fails"] = 0
-        changed = True
+    async with stats_lock:
+        if stats_cache is None:
+            globals()["stats_cache"] = await load_stats_from_disk()
+        stats = stats_cache
+        config_stats = stats.get("by_config_id", {}).get(config_id)
+        if not isinstance(config_stats, dict):
+            raise HTTPException(status_code=404, detail="未找到该配置项的统计记录")
+
+        if "disabled_until" in config_stats:
+            del config_stats["disabled_until"]
+            changed = True
+        if config_stats.get("consecutive_fails", 0) != 0:
+            config_stats["consecutive_fails"] = 0
+            changed = True
+        if changed:
+            await mark_stats_dirty(False)
 
     if changed:
-        await write_json_file(STATS_FILE, stats)
+        await flush_stats_if_needed(force=True)
         log_message(f"管理: 手动解除配置项 {config_id} 的熔断禁用状态")
 
     return {"ok": True, "config_id": config_id, "changed": changed}
@@ -1978,25 +2228,30 @@ async def unblock_config(config_id: str):
 
 @admin_router.post("/stats/ip/{ip}/unblock")
 async def unblock_ip(ip: str):
-    """手动解除指定 IP 的封禁状态。"""
-    stats = normalize_stats_structure(await read_json_file(STATS_FILE, get_default_stats()))
-    ip_stats = stats.get("by_ip", {}).get(ip)
-    if not isinstance(ip_stats, dict):
-        raise HTTPException(status_code=404, detail="未找到该 IP 的统计记录")
-
+    """手动解除指定 IP 的封禁状态；关键事件强制刷新到磁盘。"""
     changed = False
-    if ip_stats.get("is_banned"):
-        ip_stats["is_banned"] = False
-        changed = True
-    if ip_stats.get("banned_at") is not None:
-        ip_stats["banned_at"] = None
-        changed = True
-    if ip_stats.get("consecutive_fails", 0) != 0:
-        ip_stats["consecutive_fails"] = 0
-        changed = True
+    async with stats_lock:
+        if stats_cache is None:
+            globals()["stats_cache"] = await load_stats_from_disk()
+        stats = stats_cache
+        ip_stats = stats.get("by_ip", {}).get(ip)
+        if not isinstance(ip_stats, dict):
+            raise HTTPException(status_code=404, detail="未找到该 IP 的统计记录")
+
+        if ip_stats.get("is_banned"):
+            ip_stats["is_banned"] = False
+            changed = True
+        if ip_stats.get("banned_at") is not None:
+            ip_stats["banned_at"] = None
+            changed = True
+        if ip_stats.get("consecutive_fails", 0) != 0:
+            ip_stats["consecutive_fails"] = 0
+            changed = True
+        if changed:
+            await mark_stats_dirty(False)
 
     if changed:
-        await write_json_file(STATS_FILE, stats)
+        await flush_stats_if_needed(force=True)
         log_message(f"管理: 手动解除 IP {ip} 的封禁状态")
 
     return {"ok": True, "ip": ip, "changed": changed}
@@ -2070,11 +2325,59 @@ async def update_log_settings(settings: LogSettingsUpdate) -> Dict[str, bool]:
 app.include_router(admin_router)
 
 
+async def stats_periodic_flush_loop():
+    """后台周期性落盘脏统计，降低请求主链路 IO 压力。"""
+    while True:
+        try:
+            await asyncio.sleep(STATS_FLUSH_INTERVAL_SECONDS)
+            await flush_stats_if_needed()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_message(f"统计后台刷盘任务异常: {e}")
+
+
+async def cleanup_generated_images_once() -> int:
+    """删除超过保留期的生成图片文件；失败只写日志，不影响主服务。"""
+    cutoff_ts = time.time() - DETAIL_RETENTION_SECONDS
+    deleted = 0
+    try:
+        for filename in os.listdir(GENERATED_IMAGES_DIR):
+            file_path = os.path.join(GENERATED_IMAGES_DIR, filename)
+            try:
+                if not os.path.isfile(file_path):
+                    continue
+                if os.path.getmtime(file_path) < cutoff_ts:
+                    os.remove(file_path)
+                    deleted += 1
+            except Exception as e:
+                log_message(f"清理生成图片失败 {file_path}: {e}")
+    except Exception as e:
+        log_message(f"扫描生成图片目录失败: {e}")
+    if deleted:
+        log_message(f"已清理超过 {DETAIL_RETENTION_DAYS} 天的生成图片 {deleted} 个")
+    return deleted
+
+
+async def generated_image_cleanup_loop():
+    """后台周期清理过期生成图片，避免 data/generated_images 无限增长。"""
+    while True:
+        try:
+            await cleanup_generated_images_once()
+            await asyncio.sleep(GENERATED_IMAGE_CLEANUP_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_message(f"生成图片后台清理任务异常: {e}")
+            await asyncio.sleep(60)
+
+
 # --- 7. 启动和关闭事件 ---
 
 @app.on_event("startup")
 async def startup_event():
     """应用启动时执行"""
+    global stats_flush_task, generated_image_cleanup_task
     if not ADMIN_KEY:
         log_message("=" * 50)
         log_message("!!! 严重警告: 环境变量 'ADMIN_KEY' 未设置 !!!")
@@ -2083,15 +2386,26 @@ async def startup_event():
     else:
         log_message(f"服务启动，ADMIN_KEY 已加载。")
 
-    log_message("正在初始化配置文件...")
-    await get_all_schemes()
-    await get_stats()
+    log_message("正在初始化配置与统计缓存...")
+    await refresh_config_cache()
+    await init_stats_cache()
+    await cleanup_generated_images_once()
+    stats_flush_task = asyncio.create_task(stats_periodic_flush_loop())
+    generated_image_cleanup_task = asyncio.create_task(generated_image_cleanup_loop())
     log_message(f"{PROJECT_NAME} 已启动，监听端口 {PORT}")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """应用关闭时执行"""
+    for task in [stats_flush_task, generated_image_cleanup_task]:
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    await flush_stats_if_needed(force=True)
     await httpx_client.aclose()
     log_message(f"{PROJECT_NAME} 正在关闭")
 

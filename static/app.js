@@ -6,6 +6,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const loginButton = document.getElementById("login-button");
     const adminKeyInput = document.getElementById("admin-key-input");
     const loginError = document.getElementById("login-error");
+    const rememberLoginCheckbox = document.getElementById("remember-login-checkbox");
 
     const topBar = document.getElementById("top-bar");
     const appContainer = document.getElementById("app-container");
@@ -70,12 +71,17 @@ document.addEventListener("DOMContentLoaded", () => {
     const toggleFullRequestLogCheckbox = document.getElementById("toggle-full-request-log");
     const fullRequestLogStatus = document.getElementById("full-request-log-status");
 
-    let adminKey = sessionStorage.getItem("catfishAdminKey");
+    const SESSION_ADMIN_KEY_STORAGE_KEY = "catfishAdminKey";
+    const PERSISTENT_ADMIN_KEY_STORAGE_KEY = "catfishPersistentAdminKey";
+    let adminKey = sessionStorage.getItem(SESSION_ADMIN_KEY_STORAGE_KEY) || localStorage.getItem(PERSISTENT_ADMIN_KEY_STORAGE_KEY);
     let statsInterval, logsInterval;
     let allSchemesCache = {}; // 缓存配置数据，用于统计显示
+    let configStatsCache = { total: {}, today: {} };
     let isSyncingLogToggle = false;
 
     const CONFIG_COLLAPSE_STORAGE_KEY = "catfish_config_scheme_collapsed";
+    const STATS_COLLAPSE_STORAGE_KEY = "catfish_stats_sections_open";
+    const IP_PATH_DETAIL_STORAGE_KEY = "catfish_ip_path_details_open";
     const THEME_STORAGE_KEY = "catfish_console_theme";
     const API_KEY_VISIBILITY_STORAGE_KEY = "catfish_show_api_keys";
     const EFFECTS_STORAGE_KEY = "catfish_frontend_effects_enabled";
@@ -216,10 +222,25 @@ document.addEventListener("DOMContentLoaded", () => {
         loadConfigs();
     }
 
+    function persistAdminKey(key, remember) {
+        if (!key) return;
+        sessionStorage.setItem(SESSION_ADMIN_KEY_STORAGE_KEY, key);
+        if (remember) {
+            localStorage.setItem(PERSISTENT_ADMIN_KEY_STORAGE_KEY, key);
+        } else {
+            localStorage.removeItem(PERSISTENT_ADMIN_KEY_STORAGE_KEY);
+        }
+    }
+
+    function clearStoredAdminKey() {
+        sessionStorage.removeItem(SESSION_ADMIN_KEY_STORAGE_KEY);
+        localStorage.removeItem(PERSISTENT_ADMIN_KEY_STORAGE_KEY);
+    }
+
     async function authedFetch(url, options = {}) {
         if (!adminKey) {
             console.error("No admin key found");
-            showLogin("会话已过期，请重新登录");
+            showLogin("会话已过期，请重新登录", { clearPersistent: false });
             return;
         }
         const headers = { ...options.headers, 'Authorization': `Bearer ${adminKey}` };
@@ -228,15 +249,21 @@ document.addEventListener("DOMContentLoaded", () => {
         }
         const response = await fetch(url, { ...options, headers });
         if (response.status === 401) {
-            showLogin("认证失败，请重新登录");
+            showLogin("认证失败，请重新登录", { clearPersistent: true });
             return;
         }
         return response;
     }
 
-    function showLogin(errorMsg = "") {
+    function showLogin(errorMsg = "", options = {}) {
         adminKey = null;
-        sessionStorage.removeItem("catfishAdminKey");
+        sessionStorage.removeItem(SESSION_ADMIN_KEY_STORAGE_KEY);
+        if (options.clearPersistent) {
+            localStorage.removeItem(PERSISTENT_ADMIN_KEY_STORAGE_KEY);
+        }
+        if (rememberLoginCheckbox) {
+            rememberLoginCheckbox.checked = !!localStorage.getItem(PERSISTENT_ADMIN_KEY_STORAGE_KEY);
+        }
         loginOverlay.classList.remove("hidden");
         topBar.classList.add("hidden");
         appContainer.classList.add("hidden");
@@ -267,7 +294,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 loginError.textContent = "密钥不正确";
             } else if (response.ok) {
                 adminKey = key;
-                sessionStorage.setItem("catfishAdminKey", key);
+                persistAdminKey(key, !!rememberLoginCheckbox?.checked);
                 showApp();
             } else {
                 loginError.textContent = `登录失败 (状态: ${response.status})`;
@@ -277,11 +304,47 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    function loadAllData() {
-        loadConfigs();
-        loadStats();
+    async function loadAllData() {
+        await loadConfigs();
+        await loadStats();
         loadLogs();
         loadLogSettings();
+    }
+
+    function getConfigStatsMarkup(configId, totalStat = {}, todayStat = {}) {
+        const totalSuccess = totalStat.success || 0;
+        const totalFail = totalStat.fail || 0;
+        const todaySuccess = todayStat.success || 0;
+        const todayFail = todayStat.fail || 0;
+        return `
+            <div class="config-inline-stats" aria-label="请求统计">
+                <span class="config-stat-pill total-success" title="总计成功">◆ ${totalSuccess}</span>
+                <span class="config-stat-pill total-fail" title="总计失败">◆ ${totalFail}</span>
+                <span class="config-stat-pill today-success" title="今日成功">● ${todaySuccess}</span>
+                <span class="config-stat-pill today-fail" title="今日失败">● ${todayFail}</span>
+            </div>
+        `;
+    }
+
+    function renderConfigIdWithStats(configId, totalStat = {}, todayStat = {}) {
+        return `
+            <div class="config-id-stat-cell">
+                <small class="config-id-text">${escapeHtml(configId)}</small>
+                ${getConfigStatsMarkup(configId, totalStat, todayStat)}
+            </div>
+        `;
+    }
+
+    function refreshConfigStatsBadges() {
+        if (!configSchemesContainer) return;
+        configSchemesContainer.querySelectorAll("tr[data-config-id]").forEach(row => {
+            const configId = row.dataset.configId;
+            const cell = row.querySelector(".config-inline-stats");
+            if (!configId || !cell) return;
+            const totalStat = configStatsCache.total?.[configId] || { success: 0, fail: 0 };
+            const todayStat = configStatsCache.today?.[configId] || { success: 0, fail: 0 };
+            cell.outerHTML = getConfigStatsMarkup(configId, totalStat, todayStat);
+        });
     }
 
     // [重构] 加载并渲染所有方案配置
@@ -312,6 +375,8 @@ document.addEventListener("DOMContentLoaded", () => {
                 let tableRows = '';
                 if (configs.length > 0) {
                     configs.forEach(config => {
+                        const totalStat = configStatsCache.total?.[config.id] || { success: 0, fail: 0 };
+                        const todayStat = configStatsCache.today?.[config.id] || { success: 0, fail: 0 };
                         tableRows += `
                             <tr data-config-id="${config.id}" data-scheme-name="${schemeName}">
                                 <td>
@@ -332,8 +397,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                 <td><small>${formatEndpointPreset(config.endpoint_preset)}${formatImageMode(config)}</small></td>
                                 <td><small>${formatUserAgentMode(config)}</small></td>
                                 <td><small>${formatInjectionSummary(config)}</small></td>
-                                <td><small>${formatOverridesSummary(config.request_overrides)}</small></td>
-                                <td><small>${config.id}</small></td>
+                                <td>${renderConfigIdWithStats(config.id, totalStat, todayStat)}</td>
                                 <td>
                                     <div class="config-row-actions">
                                         <button type="button" class="button edit-btn">编辑</button>
@@ -345,7 +409,7 @@ document.addEventListener("DOMContentLoaded", () => {
                         `;
                     });
                 } else {
-                    tableRows = `<tr><td colspan="13">该方案下没有配置项</td></tr>`;
+                    tableRows = `<tr><td colspan="12">该方案下没有配置项</td></tr>`;
                 }
 
                 schemeBlock.innerHTML = `
@@ -374,8 +438,7 @@ document.addEventListener("DOMContentLoaded", () => {
                                     <th>预设端点</th>
                                     <th>UA 模式</th>
                                     <th>注入策略</th>
-                                    <th>强制覆盖参数</th>
-                                    <th>ID</th>
+                                    <th>ID / 统计</th>
                                     <th>操作</th>
                                 </tr>
                             </thead>
@@ -451,6 +514,10 @@ document.addEventListener("DOMContentLoaded", () => {
             const response = await authedFetch("/admin/stats");
             if (!response || !response.ok) return;
             const stats = await response.json();
+            configStatsCache = {
+                total: stats.by_config_id || {},
+                today: stats.today?.by_config_id || {}
+            };
 
             statTotalSuccess.textContent = stats.total.success || 0;
             statTotalFail.textContent = stats.total.fail || 0;
@@ -465,6 +532,7 @@ document.addEventListener("DOMContentLoaded", () => {
             renderStatsTable(statsTodayByConfigBody, allConfigsFlat, stats.today.by_config_id, false);
             // 渲染 IP 请求与封禁统计
             renderIpStatsTable(statsByIpBody, stats.by_ip || {});
+            refreshConfigStatsBadges();
 
         } catch (err) {
             console.error("加载统计失败:", err);
@@ -509,12 +577,82 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!value) return "-";
         const date = new Date(value);
         if (Number.isNaN(date.getTime())) return String(value);
-        return date.toLocaleString();
+        return date.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+    }
+
+    function getJsonStorageMap(storageKey) {
+        try {
+            const raw = localStorage.getItem(storageKey);
+            if (!raw) return {};
+            const parsed = JSON.parse(raw);
+            return parsed && typeof parsed === "object" ? parsed : {};
+        } catch {
+            return {};
+        }
+    }
+
+    function setJsonStorageMapValue(storageKey, key, value) {
+        const state = getJsonStorageMap(storageKey);
+        state[key] = value;
+        localStorage.setItem(storageKey, JSON.stringify(state));
+    }
+
+    function getIpPathDetailStateMap() {
+        return getJsonStorageMap(IP_PATH_DETAIL_STORAGE_KEY);
+    }
+
+    function setIpPathDetailOpen(ip, isOpen) {
+        setJsonStorageMapValue(IP_PATH_DETAIL_STORAGE_KEY, ip, !!isOpen);
+    }
+
+    function renderIpPathDetails(paths) {
+        const entries = Object.entries(paths || {}).sort((a, b) => {
+            const aSeen = new Date(a[1]?.last_seen_at || 0).getTime() || 0;
+            const bSeen = new Date(b[1]?.last_seen_at || 0).getTime() || 0;
+            return bSeen - aSeen;
+        });
+
+        if (entries.length === 0) {
+            return `<div class="ip-path-empty">最近 1 个月暂无路径明细</div>`;
+        }
+
+        const rows = entries.map(([path, item]) => `
+            <tr>
+                <td><code>${escapeHtml(path)}</code></td>
+                <td>${item?.total || 0}</td>
+                <td class="success-text">${item?.success || 0}</td>
+                <td class="fail-text">${item?.fail || 0}</td>
+                <td><small>${escapeHtml(formatDateTime(item?.last_seen_at))}</small></td>
+                <td><small>${escapeHtml(item?.last_fail_reason || "-")}</small></td>
+            </tr>
+        `).join("");
+
+        return `
+            <div class="ip-path-detail-panel">
+                <div class="ip-path-detail-title">最近 1 个月路径明细（仅记录 URL 路径，不含查询参数）</div>
+                <div class="table-container ip-path-detail-table-wrap">
+                    <table class="ip-path-detail-table">
+                        <thead>
+                            <tr>
+                                <th>路径</th>
+                                <th>总请求</th>
+                                <th class="success-text">成功</th>
+                                <th class="fail-text">失败</th>
+                                <th>最后访问</th>
+                                <th>最后失败原因</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            </div>
+        `;
     }
 
     function renderIpStatsTable(tbody, ipStatsData) {
         if (!tbody) return;
         tbody.innerHTML = "";
+        const detailStateMap = getIpPathDetailStateMap();
         const entries = Object.entries(ipStatsData || {}).sort((a, b) => {
             const aBanned = a[1]?.is_banned ? 1 : 0;
             const bBanned = b[1]?.is_banned ? 1 : 0;
@@ -531,9 +669,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
         entries.forEach(([ip, stat]) => {
             const isBanned = !!stat?.is_banned;
+            const safeIp = escapeHtml(ip);
+            const isDetailOpen = !!detailStateMap[ip];
+            const pathCount = stat?.paths && typeof stat.paths === "object" ? Object.keys(stat.paths).length : 0;
             const tr = document.createElement("tr");
             tr.classList.toggle("ip-banned-row", isBanned);
-            const safeIp = escapeHtml(ip);
+            tr.dataset.ip = ip;
             const statusBadge = isBanned
                 ? `<span class="status-badge status-badge-danger">已封禁</span><small>${escapeHtml(formatDateTime(stat.banned_at))}</small>`
                 : `<span class="status-badge status-badge-ok">正常</span>`;
@@ -541,7 +682,13 @@ document.addEventListener("DOMContentLoaded", () => {
                 ? `<button type="button" class="button button-secondary unblock-ip-btn" data-ip="${safeIp}">解除封禁</button>`
                 : '<em>-</em>';
             tr.innerHTML = `
-                <td><small>${safeIp}</small></td>
+                <td>
+                    <div class="ip-cell-with-toggle">
+                        <button type="button" class="ip-path-toggle-btn" data-ip="${safeIp}" aria-expanded="${isDetailOpen}">${isDetailOpen ? "收起" : "路径"}</button>
+                        <small>${safeIp}</small>
+                        <span class="ip-path-count">${pathCount}</span>
+                    </div>
+                </td>
                 <td>${stat?.total || 0}</td>
                 <td class="success-text">${stat?.success || 0}</td>
                 <td class="fail-text">${stat?.fail || 0}</td>
@@ -552,6 +699,12 @@ document.addEventListener("DOMContentLoaded", () => {
                 <td>${actionButton}</td>
             `;
             tbody.appendChild(tr);
+
+            const detailTr = document.createElement("tr");
+            detailTr.className = `ip-path-detail-row ${isDetailOpen ? "" : "hidden"}`;
+            detailTr.dataset.ip = ip;
+            detailTr.innerHTML = `<td colspan="9">${renderIpPathDetails(stat?.paths || {})}</td>`;
+            tbody.appendChild(detailTr);
         });
     }
 
@@ -1071,14 +1224,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function getSchemeCollapseStateMap() {
-        try {
-            const raw = localStorage.getItem(CONFIG_COLLAPSE_STORAGE_KEY);
-            if (!raw) return {};
-            const parsed = JSON.parse(raw);
-            return parsed && typeof parsed === "object" ? parsed : {};
-        } catch {
-            return {};
-        }
+        return getJsonStorageMap(CONFIG_COLLAPSE_STORAGE_KEY);
     }
 
     function setSchemeCollapsed(schemeName, isCollapsed) {
@@ -1160,6 +1306,19 @@ document.addEventListener("DOMContentLoaded", () => {
         return result;
     }
 
+    function initStatsCollapseState() {
+        const state = getJsonStorageMap(STATS_COLLAPSE_STORAGE_KEY);
+        document.querySelectorAll(".stats-collapse-card[data-stats-collapse-key]").forEach(details => {
+            const key = details.dataset.statsCollapseKey;
+            if (Object.prototype.hasOwnProperty.call(state, key)) {
+                details.open = !!state[key];
+            }
+            details.addEventListener("toggle", () => {
+                setJsonStorageMapValue(STATS_COLLAPSE_STORAGE_KEY, key, details.open);
+            });
+        });
+    }
+
     function renderPresetTable() {
         if (!presetTableBody) return;
         presetTableBody.innerHTML = "";
@@ -1182,11 +1341,15 @@ document.addEventListener("DOMContentLoaded", () => {
         initEffectsPreference();
         initButtonRippleEffects();
         initTheme();
+        initStatsCollapseState();
         loginButton.addEventListener("click", handleLogin);
         adminKeyInput.addEventListener("keydown", (e) => {
             if (e.key === "Enter") handleLogin();
         });
-        logoutButton.addEventListener("click", () => showLogin("您已退出登录"));
+        logoutButton.addEventListener("click", () => {
+            clearStoredAdminKey();
+            showLogin("您已退出登录", { clearPersistent: true });
+        });
 
         function updateConfigBackToTopVisibility() {
             if (!configBackToTopButton) return;
@@ -1222,6 +1385,19 @@ document.addEventListener("DOMContentLoaded", () => {
 
         if (statsByIpBody) {
             statsByIpBody.addEventListener("click", async (e) => {
+                const toggleButton = e.target.closest(".ip-path-toggle-btn");
+                if (toggleButton) {
+                    const ip = toggleButton.dataset.ip;
+                    const detailRow = statsByIpBody.querySelector(`.ip-path-detail-row[data-ip="${CSS.escape(ip)}"]`);
+                    if (!detailRow) return;
+                    const willOpen = detailRow.classList.contains("hidden");
+                    detailRow.classList.toggle("hidden", !willOpen);
+                    toggleButton.textContent = willOpen ? "收起" : "路径";
+                    toggleButton.setAttribute("aria-expanded", String(willOpen));
+                    setIpPathDetailOpen(ip, willOpen);
+                    return;
+                }
+
                 const button = e.target.closest(".unblock-ip-btn");
                 if (!button) return;
                 button.disabled = true;
@@ -1264,9 +1440,13 @@ document.addEventListener("DOMContentLoaded", () => {
             (async () => {
                 const response = await fetch("/admin/logs", { headers: { 'Authorization': `Bearer ${adminKey}` } });
                 if (response.ok) {
+                    sessionStorage.setItem(SESSION_ADMIN_KEY_STORAGE_KEY, adminKey);
+                    if (rememberLoginCheckbox) {
+                        rememberLoginCheckbox.checked = !!localStorage.getItem(PERSISTENT_ADMIN_KEY_STORAGE_KEY);
+                    }
                     showApp();
                 } else {
-                    showLogin("会话已过期，请重新登录");
+                    showLogin("会话已过期，请重新登录", { clearPersistent: true });
                 }
             })();
         } else {

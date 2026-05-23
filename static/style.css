@@ -572,6 +572,31 @@ html[data-theme="deepseek"] .theme-backdrop::after {
     margin-bottom: 1.15rem;
 }
 
+.remember-login-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.45rem;
+    margin: -0.25rem 0 0.25rem;
+    color: var(--color-text);
+    font-size: 0.9rem;
+    font-weight: 750;
+    cursor: pointer;
+}
+
+.remember-login-row input {
+    width: 1rem;
+    height: 1rem;
+    accent-color: var(--color-primary);
+}
+
+.remember-login-hint {
+    display: block;
+    margin: 0 0 0.85rem;
+    color: var(--color-text-light);
+    font-size: 0.78rem;
+}
+
 /* --- 6. 表单和按钮 --- */
 .input-group {
     margin-bottom: 1rem;
@@ -1029,6 +1054,77 @@ html[data-theme="claude"] .stat-card::after {
     margin: 0 1rem 1rem;
 }
 
+.ip-cell-with-toggle {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.42rem;
+}
+
+.ip-path-toggle-btn {
+    padding: 0.26rem 0.52rem;
+    border: 1px solid var(--theme-border);
+    border-radius: var(--radius-pill);
+    background: var(--theme-surface-soft);
+    color: var(--color-primary);
+    font-size: 0.76rem;
+    font-weight: 900;
+    line-height: 1.1;
+    box-shadow: none;
+}
+
+.ip-path-toggle-btn:hover {
+    background: var(--theme-button-gradient);
+    color: #fff;
+    transform: translateY(-1px);
+    box-shadow: var(--theme-glow);
+}
+
+.ip-path-count {
+    min-width: 1.4rem;
+    padding: 0.12rem 0.38rem;
+    border-radius: var(--radius-pill);
+    background: color-mix(in srgb, var(--color-primary) 12%, transparent);
+    color: var(--color-primary);
+    font-size: 0.72rem;
+    font-weight: 900;
+    text-align: center;
+}
+
+.ip-path-detail-row td {
+    padding: 0.85rem 1rem 1rem;
+    background: color-mix(in srgb, var(--theme-surface-soft) 78%, var(--color-primary-light));
+}
+
+.ip-path-detail-panel {
+    display: grid;
+    gap: 0.65rem;
+}
+
+.ip-path-detail-title,
+.ip-path-empty {
+    color: var(--color-text-light);
+    font-size: 0.86rem;
+    font-weight: 750;
+}
+
+.ip-path-detail-table-wrap {
+    margin: 0;
+}
+
+.ip-path-detail-table th,
+.ip-path-detail-table td {
+    padding: 0.58rem 0.72rem;
+    font-size: 0.86rem;
+}
+
+.ip-path-detail-table code {
+    display: inline-block;
+    max-width: 560px;
+    white-space: normal;
+    word-break: break-all;
+}
+
 .status-cell {
     display: inline-flex;
     flex-direction: column;
@@ -1201,6 +1297,64 @@ html[data-theme="claude"] .stat-card::after {
 .priority-step-btn:disabled {
     opacity: 0.55;
     cursor: wait;
+}
+
+.config-id-stat-cell {
+    display: grid;
+    gap: 0.5rem;
+    min-width: 11.5rem;
+}
+
+.config-id-text {
+    display: block;
+    line-height: 1.45;
+}
+
+.config-inline-stats {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(3.2rem, max-content));
+    gap: 0.28rem;
+    align-items: center;
+}
+
+.config-stat-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 3.2rem;
+    padding: 0.18rem 0.45rem;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--theme-border);
+    background: var(--theme-surface-soft);
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    font-weight: 900;
+    white-space: nowrap;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.2);
+}
+
+.config-stat-pill.total-success {
+    color: var(--color-success);
+    border-color: color-mix(in srgb, var(--color-success) 32%, transparent);
+    background: color-mix(in srgb, var(--color-success) 12%, transparent);
+}
+
+.config-stat-pill.total-fail {
+    color: var(--color-danger);
+    border-color: color-mix(in srgb, var(--color-danger) 32%, transparent);
+    background: color-mix(in srgb, var(--color-danger) 11%, transparent);
+}
+
+.config-stat-pill.today-success {
+    color: var(--color-primary);
+    border-color: color-mix(in srgb, var(--color-primary) 32%, transparent);
+    background: color-mix(in srgb, var(--color-primary) 11%, transparent);
+}
+
+.config-stat-pill.today-fail {
+    color: color-mix(in srgb, var(--color-danger) 72%, var(--color-primary));
+    border-color: color-mix(in srgb, var(--color-danger) 22%, var(--color-primary-light));
+    background: color-mix(in srgb, var(--color-danger) 7%, var(--color-primary-light));
 }
 
 .config-row-actions {

@@ -75,6 +75,11 @@
             <div class="input-group">
                 <input type="password" id="admin-key-input" placeholder="请输入管理员密钥">
             </div>
+            <label class="remember-login-row">
+                <input type="checkbox" id="remember-login-checkbox">
+                <span>记住登录状态，下次自动进入后台</span>
+            </label>
+            <small class="remember-login-hint">仅建议在可信设备上开启；退出登录会清除本地保存。</small>
             <p id="login-error" class="error-text"></p>
             <button id="login-button" class="button button-primary full-width">登录</button>
         </div>
@@ -343,7 +348,7 @@
                 </div>
 
                 <div class="stats-sections">
-                    <details class="stats-collapse-card" open>
+                    <details class="stats-collapse-card" data-stats-collapse-key="total-config" open>
                         <summary>
                             <span>按配置统计 (历史总计)</span>
                             <small>成功 / 失败 / 连续失败 / 熔断状态</small>
@@ -368,7 +373,7 @@
                         </div>
                     </details>
 
-                    <details class="stats-collapse-card">
+                    <details class="stats-collapse-card" data-stats-collapse-key="today-config">
                         <summary>
                             <span>按配置统计 (今日)</span>
                             <small>每日自动重置的配置请求计数</small>
@@ -390,7 +395,7 @@
                         </div>
                     </details>
 
-                    <details class="stats-collapse-card">
+                    <details class="stats-collapse-card" data-stats-collapse-key="ip-stats">
                         <summary>
                             <span>IP 请求与封禁统计</span>
                             <small>连续 5 次认证失败自动封禁，需手动解除</small>
