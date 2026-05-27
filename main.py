@@ -12,6 +12,7 @@ import ipaddress
 import copy
 import time
 from datetime import datetime, timedelta, timezone
+from threading import RLock
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any, Dict, Literal
 from itertools import groupby
@@ -67,8 +68,10 @@ DETAIL_RETENTION_SECONDS = DETAIL_RETENTION_DAYS * 24 * 60 * 60
 MAX_IP_PATH_STATS = 200
 # 普通统计写盘节流间隔；关键事件仍会强制刷新
 STATS_FLUSH_INTERVAL_SECONDS = 10
-# 生成图片后台清理间隔
+# 生成图片后台清理间隔；磁盘历史文件低频清理，内存图片短 TTL 高频清理
 GENERATED_IMAGE_CLEANUP_INTERVAL_SECONDS = 6 * 60 * 60
+MEMORY_GENERATED_IMAGE_TTL_SECONDS = int(os.environ.get("MEMORY_GENERATED_IMAGE_TTL_SECONDS", 10 * 60))
+MEMORY_GENERATED_IMAGE_CLEANUP_INTERVAL_SECONDS = int(os.environ.get("MEMORY_GENERATED_IMAGE_CLEANUP_INTERVAL_SECONDS", 60))
 
 # 确保数据目录存在
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -92,6 +95,8 @@ stats_last_flush_monotonic = 0.0
 stats_last_path_cleanup_date: Optional[str] = None
 generated_image_cleanup_task: Optional[asyncio.Task] = None
 stats_flush_task: Optional[asyncio.Task] = None
+memory_generated_images_lock = RLock()
+memory_generated_images: Dict[str, Dict[str, Any]] = {}
 
 # 全局 httpx 客户端 (用于连接池)
 # 设置一个合理的超时时间，例如 300 秒，兼容耗时较长的同步生图请求
@@ -224,11 +229,31 @@ def parse_stats_datetime(value: Any) -> Optional[datetime]:
         return None
 
 
+def sanitize_log_text(value: Any) -> str:
+    """避免日志记录大块内联 base64 图片，防止错误路径放大内存和 IO 压力。"""
+    text = value if isinstance(value, str) else str(value)
+    if "base64" not in text and "data:image/" not in text:
+        return text
+    text = re.sub(
+        r"data:(image/[a-zA-Z0-9.+-]+);base64,[A-Za-z0-9+/=\r\n]+",
+        r"data:\1;base64,<omitted>",
+        text,
+        flags=re.MULTILINE
+    )
+    text = re.sub(
+        r'("b64_json"\s*:\s*")[^"]+(")',
+        r'\1<omitted>\2',
+        text
+    )
+    return text
+
+
 def log_message(message: str):
     """向内存日志队列中添加一条日志"""
     now = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
-    log_deque.append(f"[{now}] {message}")
-    print(message)  # 同时也打印到控制台
+    safe_message = sanitize_log_text(message)
+    log_deque.append(f"[{now}] {safe_message}")
+    print(safe_message)  # 同时也打印到控制台
 
 
 async def read_json_file(file_path: str, default_data: Any) -> Any:
@@ -1278,7 +1303,7 @@ async def resolve_images_response_with_auto_poll(
 
         response = await httpx_client.get(poll_url, headers=headers)
         if response.status_code >= 400:
-            raise EndpointPresetError(f"图片任务 {task_id} 查询失败 (HTTP {response.status_code}): {response.text}")
+            raise EndpointPresetError(f"图片任务 {task_id} 查询失败 (HTTP {response.status_code}): {sanitize_log_text(response.text)}")
         try:
             current_payload = response.json()
         except Exception as e:
@@ -1622,14 +1647,16 @@ async def proxy_chat_completions(
                     response_json = convert_response_base64_images_to_urls(
                         response_json,
                         GENERATED_IMAGES_DIR,
-                        image_public_url_prefix
+                        image_public_url_prefix,
+                        image_saver=save_decoded_image_to_memory
                     )
                     wrapped_json = wrap_image_response_as_chat_completion(
                         response_json,
                         request_body,
                         config,
                         image_output_dir=GENERATED_IMAGES_DIR,
-                        image_public_url_prefix=image_public_url_prefix
+                        image_public_url_prefix=image_public_url_prefix,
+                        image_saver=save_decoded_image_to_memory
                     )
 
                     if show_full_response_body:
@@ -1693,11 +1720,12 @@ async def proxy_chat_completions(
                     if response.status_code >= 400:
                         response_body = await response.aread()
                         error_text = response_body.decode('utf-8')
+                        safe_error_text = sanitize_log_text(error_text)
                         log_message(
-                            f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (HTTP {response.status_code}, 策略={mode_plan['mode_label']}): {error_text}")
-                        last_error = f"HTTP {response.status_code}: {error_text}"
+                            f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (HTTP {response.status_code}, 策略={mode_plan['mode_label']}): {safe_error_text}")
+                        last_error = f"HTTP {response.status_code}: {safe_error_text}"
                         if show_full_response_body:
-                            log_message(f"响应体完整内容: {error_text}")
+                            log_message(f"响应体完整内容: {safe_error_text}")
                         try:
                             error_content = json.loads(error_text)
                         except Exception:
@@ -1802,7 +1830,8 @@ async def proxy_chat_completions(
                     merged_json = convert_response_base64_images_to_urls(
                         merged_json,
                         GENERATED_IMAGES_DIR,
-                        image_public_url_prefix
+                        image_public_url_prefix,
+                        image_saver=save_decoded_image_to_memory
                     )
                     total_tokens = extract_total_tokens(merged_json)
                     if show_full_response_body:
@@ -1828,7 +1857,8 @@ async def proxy_chat_completions(
                 response_json = convert_response_base64_images_to_urls(
                     response_json,
                     GENERATED_IMAGES_DIR,
-                    image_public_url_prefix
+                    image_public_url_prefix,
+                    image_saver=save_decoded_image_to_memory
                 )
                 if show_full_response_body:
                     try:
@@ -1943,10 +1973,11 @@ async def proxy_chat_completions(
                 break
             except httpx.HTTPStatusError as e:
                 last_error, last_error_response = e, e.response
+                safe_error_text = sanitize_log_text(e.response.text)
                 log_message(
-                    f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (HTTP {e.response.status_code}): {e.response.text}")
+                    f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (HTTP {e.response.status_code}): {safe_error_text}")
                 if show_full_response_body:
-                    log_message(f"响应体完整内容: {e.response.text}")
+                    log_message(f"响应体完整内容: {safe_error_text}")
                 try:
                     await ensure_client_connected()
                 except ClientRequestAborted as disconnect_error:
@@ -2337,6 +2368,61 @@ async def stats_periodic_flush_loop():
             log_message(f"统计后台刷盘任务异常: {e}")
 
 
+def prune_expired_memory_generated_images(now_ts: Optional[float] = None) -> int:
+    """清理过期的内存生成图片；不设置容量上限，只按 TTL 生命周期回收。"""
+    now = now_ts or time.time()
+    deleted = 0
+    with memory_generated_images_lock:
+        for filename, entry in list(memory_generated_images.items()):
+            expires_at = float(entry.get("expires_at", 0) or 0)
+            if expires_at <= now:
+                memory_generated_images.pop(filename, None)
+                deleted += 1
+    return deleted
+
+
+def save_decoded_image_to_memory(
+        decoded: Dict[str, Any],
+        output_dir: Optional[str],
+        public_url_prefix: Optional[str]
+) -> Optional[str]:
+    """把 base64 解码后的图片保存到短生命周期内存缓存，并返回兼容的公开 URL。"""
+    if not public_url_prefix:
+        return None
+    image_bytes = decoded.get("bytes")
+    if not isinstance(image_bytes, (bytes, bytearray)) or not image_bytes:
+        return None
+
+    prune_expired_memory_generated_images()
+    extension = str(decoded.get("extension") or ".png")
+    if not extension.startswith("."):
+        extension = f".{extension}"
+    filename = f"img_{int(time.time())}_{uuid.uuid4().hex}{extension}"
+    now = time.time()
+    with memory_generated_images_lock:
+        memory_generated_images[filename] = {
+            "bytes": bytes(image_bytes),
+            "media_type": str(decoded.get("media_type") or "image/png"),
+            "created_at": now,
+            "expires_at": now + MEMORY_GENERATED_IMAGE_TTL_SECONDS,
+        }
+    return f"{public_url_prefix.rstrip('/')}/{filename}"
+
+
+def get_memory_generated_image(filename: str) -> Optional[Dict[str, Any]]:
+    """读取未过期的内存生成图片；访问时顺手清理当前过期条目。"""
+    now = time.time()
+    with memory_generated_images_lock:
+        entry = memory_generated_images.get(filename)
+        if not entry:
+            return None
+        expires_at = float(entry.get("expires_at", 0) or 0)
+        if expires_at <= now:
+            memory_generated_images.pop(filename, None)
+            return None
+        return dict(entry)
+
+
 async def cleanup_generated_images_once() -> int:
     """删除超过保留期的生成图片文件；失败只写日志，不影响主服务。"""
     cutoff_ts = time.time() - DETAIL_RETENTION_SECONDS
@@ -2360,11 +2446,20 @@ async def cleanup_generated_images_once() -> int:
 
 
 async def generated_image_cleanup_loop():
-    """后台周期清理过期生成图片，避免 data/generated_images 无限增长。"""
+    """后台周期清理过期生成图片；新图片清理内存，旧磁盘文件低频兼容清理。"""
+    last_disk_cleanup_ts = 0.0
     while True:
         try:
-            await cleanup_generated_images_once()
-            await asyncio.sleep(GENERATED_IMAGE_CLEANUP_INTERVAL_SECONDS)
+            deleted_memory = prune_expired_memory_generated_images()
+            if deleted_memory:
+                log_message(f"已清理过期内存生成图片 {deleted_memory} 个")
+
+            now = time.time()
+            if now - last_disk_cleanup_ts >= GENERATED_IMAGE_CLEANUP_INTERVAL_SECONDS:
+                await cleanup_generated_images_once()
+                last_disk_cleanup_ts = now
+
+            await asyncio.sleep(MEMORY_GENERATED_IMAGE_CLEANUP_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -2413,7 +2508,32 @@ async def shutdown_event():
 # --- 8. 静态文件服务 (用于前端和生成图片) ---
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
-app.mount(GENERATED_IMAGES_ROUTE, StaticFiles(directory=GENERATED_IMAGES_DIR), name="generated_images")
+
+
+@app.get(f"{GENERATED_IMAGES_ROUTE}/{{filename:path}}", tags=["Generated Images"])
+async def read_generated_image(filename: str):
+    """从短生命周期内存缓存返回生成图片；找不到时兼容读取历史磁盘文件。"""
+    safe_filename = os.path.basename(filename)
+    if not safe_filename or safe_filename != filename:
+        raise HTTPException(status_code=404, detail="图片不存在或已过期")
+
+    entry = get_memory_generated_image(safe_filename)
+    if entry:
+        headers = {
+            "Cache-Control": f"private, max-age={max(MEMORY_GENERATED_IMAGE_TTL_SECONDS, 0)}",
+            "X-Generated-Image-Storage": "memory",
+        }
+        return Response(
+            content=entry.get("bytes") or b"",
+            media_type=str(entry.get("media_type") or "image/png"),
+            headers=headers
+        )
+
+    legacy_file_path = os.path.join(GENERATED_IMAGES_DIR, safe_filename)
+    if os.path.isfile(legacy_file_path):
+        return FileResponse(legacy_file_path)
+
+    raise HTTPException(status_code=404, detail="图片不存在或已过期")
 
 
 @app.get("/", tags=["Frontend"])

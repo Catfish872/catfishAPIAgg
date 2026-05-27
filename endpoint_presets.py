@@ -3,7 +3,7 @@ import os
 import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urljoin
 
 
@@ -288,12 +288,16 @@ def _decode_base64_image(value: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def save_base64_image_as_url(value: str, output_dir: Optional[str], public_url_prefix: Optional[str]) -> Optional[str]:
-    """把 b64_json 或 data:image base64 保存为文件，并返回公开 URL。"""
+Base64ImageSaver = Callable[[Dict[str, Any], Optional[str], Optional[str]], Optional[str]]
+
+
+def _save_decoded_base64_image_to_disk(
+        decoded: Dict[str, Any],
+        output_dir: Optional[str],
+        public_url_prefix: Optional[str]
+) -> Optional[str]:
+    """默认兼容保存器：把解码后的图片写入磁盘，并返回公开 URL。"""
     if not output_dir or not public_url_prefix:
-        return None
-    decoded = _decode_base64_image(value)
-    if not decoded:
         return None
     os.makedirs(output_dir, exist_ok=True)
     filename = f"img_{int(time.time())}_{uuid.uuid4().hex}{decoded['extension']}"
@@ -301,6 +305,20 @@ def save_base64_image_as_url(value: str, output_dir: Optional[str], public_url_p
     with open(file_path, "wb") as f:
         f.write(decoded["bytes"])
     return f"{public_url_prefix.rstrip('/')}/{filename}"
+
+
+def save_base64_image_as_url(
+        value: str,
+        output_dir: Optional[str],
+        public_url_prefix: Optional[str],
+        image_saver: Optional[Base64ImageSaver] = None
+) -> Optional[str]:
+    """把 b64_json 或 data:image base64 转为公开 URL；保存介质由 image_saver 决定，默认写磁盘。"""
+    decoded = _decode_base64_image(value)
+    if not decoded:
+        return None
+    saver = image_saver or _save_decoded_base64_image_to_disk
+    return saver(decoded, output_dir, public_url_prefix)
 
 
 _INLINE_DATA_IMAGE_RE = re.compile(
@@ -312,7 +330,8 @@ _INLINE_DATA_IMAGE_RE = re.compile(
 def replace_inline_base64_images_with_urls(
         text: str,
         output_dir: Optional[str],
-        public_url_prefix: Optional[str]
+        public_url_prefix: Optional[str],
+        image_saver: Optional[Base64ImageSaver] = None
 ) -> str:
     """替换字符串中的 data:image base64 为公开 URL，兼容 markdown 图片和裸 data URL。"""
     if not isinstance(text, str) or "data:image/" not in text:
@@ -320,7 +339,7 @@ def replace_inline_base64_images_with_urls(
 
     def _replace(match: re.Match) -> str:
         data_url = f"data:{match.group(1)};base64,{match.group(2)}"
-        saved_url = save_base64_image_as_url(data_url, output_dir, public_url_prefix)
+        saved_url = save_base64_image_as_url(data_url, output_dir, public_url_prefix, image_saver=image_saver)
         return saved_url or match.group(0)
 
     return _INLINE_DATA_IMAGE_RE.sub(_replace, text)
@@ -329,7 +348,8 @@ def replace_inline_base64_images_with_urls(
 def convert_response_base64_images_to_urls(
         payload: Any,
         image_output_dir: Optional[str],
-        image_public_url_prefix: Optional[str]
+        image_public_url_prefix: Optional[str],
+        image_saver: Optional[Base64ImageSaver] = None
 ) -> Any:
     """递归处理任意 JSON 响应中的 base64 图片，把 data URL / b64_json 转为公开 URL。
 
@@ -341,13 +361,13 @@ def convert_response_base64_images_to_urls(
     """
     if isinstance(payload, list):
         for index, item in enumerate(payload):
-            payload[index] = convert_response_base64_images_to_urls(item, image_output_dir, image_public_url_prefix)
+            payload[index] = convert_response_base64_images_to_urls(item, image_output_dir, image_public_url_prefix, image_saver=image_saver)
         return payload
 
     if isinstance(payload, dict):
         b64_json = payload.get("b64_json")
         if isinstance(b64_json, str) and b64_json.strip():
-            saved_url = save_base64_image_as_url(b64_json, image_output_dir, image_public_url_prefix)
+            saved_url = save_base64_image_as_url(b64_json, image_output_dir, image_public_url_prefix, image_saver=image_saver)
             if saved_url:
                 current_url = payload.get("url")
                 if not isinstance(current_url, str) or not current_url.strip() or current_url.startswith("data:image/"):
@@ -356,13 +376,13 @@ def convert_response_base64_images_to_urls(
 
         for key, value in list(payload.items()):
             if isinstance(value, str):
-                payload[key] = replace_inline_base64_images_with_urls(value, image_output_dir, image_public_url_prefix)
+                payload[key] = replace_inline_base64_images_with_urls(value, image_output_dir, image_public_url_prefix, image_saver=image_saver)
             elif isinstance(value, (dict, list)):
-                payload[key] = convert_response_base64_images_to_urls(value, image_output_dir, image_public_url_prefix)
+                payload[key] = convert_response_base64_images_to_urls(value, image_output_dir, image_public_url_prefix, image_saver=image_saver)
         return payload
 
     if isinstance(payload, str):
-        return replace_inline_base64_images_with_urls(payload, image_output_dir, image_public_url_prefix)
+        return replace_inline_base64_images_with_urls(payload, image_output_dir, image_public_url_prefix, image_saver=image_saver)
 
     return payload
 
@@ -372,9 +392,10 @@ def wrap_image_response_as_chat_completion(
         raw_body: Dict[str, Any],
         config: Any,
         image_output_dir: Optional[str] = None,
-        image_public_url_prefix: Optional[str] = None
+        image_public_url_prefix: Optional[str] = None,
+        image_saver: Optional[Base64ImageSaver] = None
 ) -> Dict[str, Any]:
-    """将 Images Generations 响应包装为 OpenAI chat.completion。base64 图片会优先落盘并以 URL 返回。"""
+    """将 Images Generations 响应包装为 OpenAI chat.completion。base64 图片会优先转为 URL 返回。"""
     data = response.get("data") if isinstance(response, dict) else None
     if not isinstance(data, list) or not data:
         raise EndpointPresetError("上游 images_generations 响应缺少 data 数组")
@@ -387,14 +408,14 @@ def wrap_image_response_as_chat_completion(
         url = item.get("url") if isinstance(item.get("url"), str) else None
         b64_json = item.get("b64_json") if isinstance(item.get("b64_json"), str) else None
 
-        # 有些上游把 data URL 放在 url 字段；这种也落盘成普通 URL。
+        # 有些上游把 data URL 放在 url 字段；这种也转成普通 URL。
         if isinstance(url, str) and url.startswith("data:image/"):
-            saved_url = save_base64_image_as_url(url, image_output_dir, image_public_url_prefix)
+            saved_url = save_base64_image_as_url(url, image_output_dir, image_public_url_prefix, image_saver=image_saver)
             if saved_url:
                 url = saved_url
 
         if not url and b64_json:
-            saved_url = save_base64_image_as_url(b64_json, image_output_dir, image_public_url_prefix)
+            saved_url = save_base64_image_as_url(b64_json, image_output_dir, image_public_url_prefix, image_saver=image_saver)
             if saved_url:
                 url = saved_url
 
