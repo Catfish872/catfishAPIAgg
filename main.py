@@ -288,6 +288,49 @@ async def write_json_file(file_path: str, data: Any):
 
 
 # 配置相关的 I/O 与缓存
+def _strip_optional_text(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else None
+    return value
+
+
+def normalize_config_text_fields(config_data: dict) -> bool:
+    """清理配置中的文本字段首尾空白，返回是否发生变更。"""
+    if not isinstance(config_data, dict):
+        return False
+
+    changed = False
+    required_text_fields = ["url", "api_key"]
+    optional_text_fields = [
+        "model",
+        "custom_user_agent",
+        "image_generation_path",
+        "image_edit_path",
+        "image_custom_generation_path",
+        "image_custom_edit_path",
+        "image_custom_reference_field",
+        "image_custom_reference_object_url_field",
+    ]
+
+    for field in required_text_fields:
+        value = config_data.get(field)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped != value:
+                config_data[field] = stripped
+                changed = True
+
+    for field in optional_text_fields:
+        value = config_data.get(field)
+        normalized = _strip_optional_text(value)
+        if normalized != value:
+            config_data[field] = normalized
+            changed = True
+
+    return changed
+
+
 async def load_config_data_from_disk() -> Dict[str, List[dict]]:
     """从磁盘读取配置并归一化；仅启动、缓存缺失或异常回退时使用。"""
     configs_data = await read_json_file(CONFIG_FILE, {})
@@ -306,7 +349,17 @@ async def load_config_data_from_disk() -> Dict[str, List[dict]]:
     for scheme_name, configs_list in configs_data.items():
         if not isinstance(configs_list, list):
             continue
-        normalized[str(scheme_name)] = [item for item in configs_list if isinstance(item, dict)]
+        scheme_key = str(scheme_name).strip() or "default"
+        if scheme_key != str(scheme_name):
+            changed = True
+        normalized_items = []
+        for item in configs_list:
+            if not isinstance(item, dict):
+                continue
+            item_copy = dict(item)
+            changed = normalize_config_text_fields(item_copy) or changed
+            normalized_items.append(item_copy)
+        normalized[scheme_key] = normalized_items
 
     if changed:
         await write_json_file(CONFIG_FILE, normalized)
@@ -352,10 +405,14 @@ async def get_all_schemes() -> Dict[str, List[ApiConfig]]:
 async def save_all_schemes(schemes: Dict[str, List[ApiConfig]]):
     """保存所有方案配置，并同步刷新内存缓存。"""
     global config_cache
-    schemes_data = {
-        scheme_name: [config.dict() for config in configs]
-        for scheme_name, configs in schemes.items()
-    }
+    schemes_data = {}
+    for scheme_name, configs in schemes.items():
+        scheme_key = str(scheme_name).strip() or "default"
+        schemes_data[scheme_key] = []
+        for config in configs:
+            config_data = config.dict()
+            normalize_config_text_fields(config_data)
+            schemes_data[scheme_key].append(config_data)
     await write_json_file(CONFIG_FILE, schemes_data)
     async with config_lock:
         config_cache = copy.deepcopy(schemes_data)
@@ -994,30 +1051,32 @@ def apply_user_agent_header(headers: Dict[str, str], user_agent_mode: Optional[s
     return headers
 
 
+def _as_token_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    return value if isinstance(value, int) else None
+
+
+def _iter_json_nodes(obj: Any, max_depth: int = 6):
+    stack = [(obj, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > max_depth:
+            continue
+
+        if isinstance(current, dict):
+            yield current
+            for v in current.values():
+                if isinstance(v, (dict, list)):
+                    stack.append((v, depth + 1))
+        elif isinstance(current, list):
+            for item in current:
+                if isinstance(item, (dict, list)):
+                    stack.append((item, depth + 1))
+
+
 def extract_total_tokens(payload: Any) -> Optional[int]:
     """兼容 OpenAI / Claude / Gemini 等常见响应结构的总 token 提取。"""
-
-    def as_int(value: Any) -> Optional[int]:
-        if isinstance(value, bool):
-            return None
-        return value if isinstance(value, int) else None
-
-    def iter_nodes(obj: Any, max_depth: int = 6):
-        stack = [(obj, 0)]
-        while stack:
-            current, depth = stack.pop()
-            if depth > max_depth:
-                continue
-
-            if isinstance(current, dict):
-                yield current
-                for v in current.values():
-                    if isinstance(v, (dict, list)):
-                        stack.append((v, depth + 1))
-            elif isinstance(current, list):
-                for item in current:
-                    if isinstance(item, (dict, list)):
-                        stack.append((item, depth + 1))
 
     # 1) 先尝试各种“总量字段”
     total_keys = [
@@ -1026,9 +1085,9 @@ def extract_total_tokens(payload: Any) -> Optional[int]:
         "total_token_count",
         "token_count"
     ]
-    for node in iter_nodes(payload):
+    for node in _iter_json_nodes(payload):
         for key in total_keys:
-            val = as_int(node.get(key))
+            val = _as_token_int(node.get(key))
             if val is not None:
                 return val
 
@@ -1042,20 +1101,57 @@ def extract_total_tokens(payload: Any) -> Optional[int]:
         ("input_token_count", "output_token_count")
     ]
 
-    for node in iter_nodes(payload):
+    for node in _iter_json_nodes(payload):
         for a, b in pair_keys:
-            va = as_int(node.get(a))
-            vb = as_int(node.get(b))
+            va = _as_token_int(node.get(a))
+            vb = _as_token_int(node.get(b))
             if va is not None and vb is not None:
                 total = va + vb
 
                 # Gemini 常见附加字段，存在则叠加
                 for extra_key in ["toolUsePromptTokenCount", "thoughtsTokenCount", "cachedContentTokenCount"]:
-                    extra_val = as_int(node.get(extra_key))
+                    extra_val = _as_token_int(node.get(extra_key))
                     if extra_val is not None:
                         total += extra_val
 
                 return total
+
+    return None
+
+
+def extract_cached_tokens(payload: Any) -> Optional[int]:
+    """提取缓存命中的 token 数量，兼容常见 OpenAI / Claude / Gemini 命名。"""
+    direct_keys = [
+        "cached_tokens",                 # OpenAI: usage.prompt_tokens_details.cached_tokens
+        "cachedTokens",
+        "cached_token_count",
+        "cachedTokenCount",
+        "cache_read_input_tokens",       # Claude: usage.cache_read_input_tokens
+        "cacheReadInputTokens",
+        "cache_read_tokens",
+        "cacheReadTokens",
+        "cachedContentTokenCount",       # Gemini cached content
+    ]
+    for node in _iter_json_nodes(payload):
+        for key in direct_keys:
+            val = _as_token_int(node.get(key))
+            if val is not None:
+                return val
+
+    detail_pairs = [
+        ("prompt_tokens_details", "cached_tokens"),
+        ("promptTokensDetails", "cachedTokens"),
+        ("input_token_details", "cache_read"),
+        ("inputTokenDetails", "cacheRead"),
+    ]
+    for node in _iter_json_nodes(payload):
+        for outer_key, inner_key in detail_pairs:
+            detail = node.get(outer_key)
+            if not isinstance(detail, dict):
+                continue
+            val = _as_token_int(detail.get(inner_key))
+            if val is not None:
+                return val
 
     return None
 
@@ -1550,14 +1646,17 @@ async def proxy_chat_completions(
             success_index_in_group = 0  # 理论上不会发生
 
         # 准备请求（固定部分）
-        proxy_url = f"{config.url.rstrip('/')}/chat/completions"
+        upstream_base_url = config.url.strip()
+        upstream_api_key = config.api_key.strip()
+        upstream_model = config.model.strip() if isinstance(config.model, str) and config.model.strip() else None
+        proxy_url = f"{upstream_base_url.rstrip('/')}/chat/completions"
 
         mode_plan = resolve_stream_modes(is_stream, config.stream_mode_strategy)
         upstream_is_stream = mode_plan["upstream_is_stream"]
         downstream_is_stream = mode_plan["downstream_is_stream"]
 
         proxy_headers = {
-            "Authorization": f"Bearer {config.api_key}",
+            "Authorization": f"Bearer {upstream_api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json" if not upstream_is_stream else "text/event-stream"
         }
@@ -1585,8 +1684,8 @@ async def proxy_chat_completions(
                 proxy_body.update(request_overrides)
 
             # model 保持配置优先
-            if config.model:
-                proxy_body["model"] = config.model
+            if upstream_model:
+                proxy_body["model"] = upstream_model
 
             # 注入消息（每条消息可独立配置最前/最后；兼容旧版配置级 injection_position）
             injected_message_groups = split_injected_messages_by_position(config.injected_messages, config.injection_position)
@@ -1602,7 +1701,7 @@ async def proxy_chat_completions(
 
                 if config.endpoint_preset == "images_generations":
                     images_path, images_body = build_images_request_plan(proxy_body, config)
-                    images_proxy_url = f"{config.url.rstrip('/')}{images_path}"
+                    images_proxy_url = f"{upstream_base_url.rstrip('/')}{images_path}"
                     images_headers = dict(proxy_headers)
                     images_headers["Accept"] = "application/json"
                     if request_body.get("stream", False):
@@ -1635,7 +1734,7 @@ async def proxy_chat_completions(
 
                     response_json = await resolve_images_response_with_auto_poll(
                         response,
-                        config.url.rstrip('/'),
+                        upstream_base_url.rstrip('/'),
                         images_path,
                         images_headers,
                         config,
@@ -1643,7 +1742,7 @@ async def proxy_chat_completions(
                         on_task_accepted=on_image_task_accepted
                     )
                     image_public_url_prefix = str(request.base_url).rstrip("/") + GENERATED_IMAGES_ROUTE
-                    response_json = normalize_image_response_urls(response_json, config.url)
+                    response_json = normalize_image_response_urls(response_json, upstream_base_url)
                     response_json = convert_response_base64_images_to_urls(
                         response_json,
                         GENERATED_IMAGES_DIR,
@@ -1764,9 +1863,10 @@ async def proxy_chat_completions(
                         async def final_stream_generator(successful_config, ctx, resp):
                             pending = bytearray()
                             total_tokens = None
+                            cached_tokens = None
 
                             def try_extract_usage_from_sse_line(line_text: str):
-                                nonlocal total_tokens
+                                nonlocal total_tokens, cached_tokens
                                 line_text = line_text.strip()
                                 if not line_text.startswith("data:"):
                                     return
@@ -1784,6 +1884,10 @@ async def proxy_chat_completions(
                                 if extracted_total is not None:
                                     total_tokens = extracted_total
 
+                                extracted_cached = extract_cached_tokens(data_obj)
+                                if extracted_cached is not None:
+                                    cached_tokens = extracted_cached
+
                             try:
                                 async for chunk in resp.aiter_bytes():
                                     yield chunk
@@ -1797,10 +1901,9 @@ async def proxy_chat_completions(
                                 if pending:
                                     try_extract_usage_from_sse_line(pending.decode("utf-8", errors="ignore"))
 
-                                if total_tokens is not None:
-                                    log_message(f"配置项 ID: {successful_config.id} 流式请求结束 (total_tokens={total_tokens}, 策略={mode_plan['mode_label']}，成功统计已在启动时记录)")
-                                else:
-                                    log_message(f"配置项 ID: {successful_config.id} 流式请求结束 (total_tokens=未知, 策略={mode_plan['mode_label']}，成功统计已在启动时记录)")
+                                total_tokens_text = total_tokens if total_tokens is not None else "未知"
+                                cached_tokens_text = cached_tokens if cached_tokens is not None else "未知"
+                                log_message(f"配置项 ID: {successful_config.id} 流式请求结束 (total_tokens={total_tokens_text}, cached_tokens={cached_tokens_text}, 策略={mode_plan['mode_label']})")
                             except Exception as e:
                                 error_type = type(e).__name__
                                 if "ClientDisconnect" in error_type or "CancelledError" in error_type:
@@ -1814,7 +1917,7 @@ async def proxy_chat_completions(
                                 await ctx.__aexit__(None, None, None)
 
                         log_message(
-                            f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次流式请求启动成功 (HTTP {response.status_code}, 策略={mode_plan['mode_label']}，立即记录成功并推进轮询)")
+                            f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次流式请求启动成功 (HTTP {response.status_code}, 策略={mode_plan['mode_label']})")
                         await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                         response_context_to_pass = response_context
                         response_context = None
@@ -2297,9 +2400,9 @@ async def get_logs() -> List[str]:
 @admin_router.post("/models/query")
 async def query_upstream_models(query: UpstreamModelQueryRequest, request: Request) -> Dict[str, Any]:
     """使用当前表单中未保存的 URL/Key/UA 模式查询上游 OpenAI 兼容模型列表。"""
-    upstream_url = f"{query.url.rstrip('/')}/models"
+    upstream_url = f"{query.url.strip().rstrip('/')}/models"
     headers = {
-        "Authorization": f"Bearer {query.api_key}",
+        "Authorization": f"Bearer {query.api_key.strip()}",
         "Accept": "application/json"
     }
     apply_user_agent_header(
