@@ -68,8 +68,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // 日志 Tab
     const logsContent = document.getElementById("logs-content");
-    const toggleFullRequestLogCheckbox = document.getElementById("toggle-full-request-log");
-    const fullRequestLogStatus = document.getElementById("full-request-log-status");
+    const logDetailModal = document.getElementById("log-detail-modal");
+    const logDetailTitle = document.getElementById("log-detail-title");
+    const logDetailSubtitle = document.getElementById("log-detail-subtitle");
+    const logDetailBody = document.getElementById("log-detail-body");
 
     const SESSION_ADMIN_KEY_STORAGE_KEY = "catfishAdminKey";
     const PERSISTENT_ADMIN_KEY_STORAGE_KEY = "catfishPersistentAdminKey";
@@ -77,7 +79,7 @@ document.addEventListener("DOMContentLoaded", () => {
     let statsInterval, logsInterval;
     let allSchemesCache = {}; // 缓存配置数据，用于统计显示
     let configStatsCache = { total: {}, today: {} };
-    let isSyncingLogToggle = false;
+    let latestLogEntries = [];
 
     const CONFIG_COLLAPSE_STORAGE_KEY = "catfish_config_scheme_collapsed";
     const STATS_COLLAPSE_STORAGE_KEY = "catfish_stats_sections_open";
@@ -206,6 +208,16 @@ document.addEventListener("DOMContentLoaded", () => {
         return div.innerHTML;
     }
 
+    function escapeAttr(value) {
+        return String(value ?? "").replace(/[&<>"']/g, (char) => {
+            if (char === "&") return "&" + "amp;";
+            if (char === "<") return "&" + "lt;";
+            if (char === ">") return "&" + "gt;";
+            if (char === String.fromCharCode(34)) return "&" + "quot;";
+            return "&" + "#39;";
+        });
+    }
+
     function maskApiKey(apiKey) {
         if (!apiKey) return "";
         if (apiKey.length <= 8) return "••••••••";
@@ -308,7 +320,6 @@ document.addEventListener("DOMContentLoaded", () => {
         await loadConfigs();
         await loadStats();
         loadLogs();
-        loadLogSettings();
     }
 
     function getConfigStatsMarkup(configId, totalStat = {}, todayStat = {}) {
@@ -745,57 +756,311 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
 
+    const LOG_STATUS_META = {
+        pending: { label: "准备中", className: "pending" },
+        streaming: { label: "流式中", className: "streaming" },
+        image_pending: { label: "图片处理中", className: "streaming" },
+        success: { label: "成功", className: "success" },
+        failed: { label: "失败", className: "failed" },
+        cancelled: { label: "已取消", className: "cancelled" },
+        retried: { label: "已重试", className: "retried" },
+        warning: { label: "警告", className: "warning" },
+        info: { label: "信息", className: "info" }
+    };
+
+    const LOG_MODE_LABELS = {
+        stream: "流式",
+        non_stream: "非流式",
+        fake_stream: "假流式",
+        fake_non_stream: "假非流",
+        images: "图片",
+        images_fake_stream: "图片假流",
+        anthropic_stream: "Anthropic→OpenAI 流式",
+        anthropic_non_stream: "Anthropic→OpenAI 非流式",
+        anthropic_fake_stream: "Anthropic→OpenAI 假流",
+        anthropic_fake_non_stream: "Anthropic→OpenAI 假非流",
+        anthropic_native_stream: "Anthropic 原生流式",
+        anthropic_native_non_stream: "Anthropic 原生非流式",
+        anthropic_native_fake_stream: "Anthropic 原生假流",
+        anthropic_native_fake_non_stream: "Anthropic 原生假非流"
+    };
+
+    function getLogStatusMeta(entry) {
+        const status = entry?.status || "info";
+        const meta = LOG_STATUS_META[status] || { label: entry?.status_label || status, className: "info" };
+        return {
+            label: entry?.status_label || meta.label,
+            className: meta.className
+        };
+    }
+
+    function formatLogTime(value) {
+        if (!value) return "--";
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return String(value);
+        return date.toLocaleString("zh-CN", { hour12: false });
+    }
+
+    function formatDuration(ms) {
+        if (ms === null || ms === undefined || ms === "") return "--";
+        const value = Number(ms);
+        if (!Number.isFinite(value)) return "--";
+        if (value < 1000) return `${Math.max(0, Math.round(value))} ms`;
+        return `${(value / 1000).toFixed(value < 10000 ? 2 : 1)} s`;
+    }
+
+    function formatLogValue(value) {
+        if (value === null || value === undefined || value === "") return "--";
+        if (Array.isArray(value)) return value.length ? value.join(", ") : "--";
+        if (typeof value === "object") return JSON.stringify(value, null, 2);
+        return String(value);
+    }
+
+    function normalizeLogPayload(payload) {
+        if (Array.isArray(payload)) {
+            return payload.map((line, index) => normalizeRawLogLine(line, index));
+        }
+        const entries = Array.isArray(payload?.entries) ? payload.entries : [];
+        if (entries.length) return entries;
+        const rawLogs = Array.isArray(payload?.raw_logs) ? payload.raw_logs : [];
+        return rawLogs.map((line, index) => normalizeRawLogLine(line, index));
+    }
+
+    function normalizeRawLogLine(line, index) {
+        const text = String(line ?? "");
+        return {
+            kind: "system",
+            id: `raw-${index}-${text.length}`,
+            status: text.includes("失败") || text.includes("错误") ? "failed" : "info",
+            title: "原始日志",
+            message: text,
+            started_at: null,
+            updated_at: null,
+            duration_ms: 0,
+            raw_logs: [text],
+            events: [{ type: "raw", label: "原始日志", message: text, raw: text }]
+        };
+    }
+
+    function getLogSummary(entry) {
+        const events = Array.isArray(entry.events) ? entry.events : [];
+        const lastEvent = events.length ? events[events.length - 1] : null;
+        return entry.error_message || entry.response_summary || entry.message || lastEvent?.message || entry.title || "暂无摘要";
+    }
+
+    function getLogPills(entry) {
+        const pills = [];
+        if (entry.kind === "attempt") {
+            pills.push(["方案", entry.scheme_name]);
+            pills.push(["配置", entry.config_id]);
+            pills.push(["模式", LOG_MODE_LABELS[entry.mode] || entry.mode]);
+            pills.push(["尝试", entry.attempt_current && entry.attempt_total ? `${entry.attempt_current}/${entry.attempt_total}` : null]);
+            pills.push(["HTTP", entry.http_status]);
+            pills.push(["策略", entry.strategy]);
+            pills.push(["Token", entry.total_tokens]);
+            pills.push(["缓存", entry.cached_tokens]);
+            pills.push(["耗时", formatDuration(entry.duration_ms)]);
+            if (Array.isArray(entry.image_urls) && entry.image_urls.length) pills.push(["图片", `${entry.image_urls.length} 张`]);
+        } else {
+            pills.push(["类型", entry.status_label || entry.title || "系统事件"]);
+            pills.push(["耗时", formatDuration(entry.duration_ms)]);
+        }
+        return pills.filter(([, value]) => value !== null && value !== undefined && value !== "" && value !== "--");
+    }
+
+    function renderLogEntry(entry) {
+        const statusMeta = getLogStatusMeta(entry);
+        const title = entry.kind === "attempt"
+            ? (entry.title || `${entry.scheme_name || "未知方案"} / ${entry.config_id || "未知配置"}`)
+            : (entry.title || entry.status_label || "系统事件");
+        const kindLabel = entry.kind === "attempt" ? "上游请求" : "系统事件";
+        const pills = getLogPills(entry).map(([label, value]) => `
+            <span class="log-pill"><b>${escapeHtml(label)}</b>${escapeHtml(value)}</span>
+        `).join("");
+        return `
+            <article class="log-entry log-entry-${escapeHtml(statusMeta.className)} ${entry.kind === "system" ? "log-entry-system" : ""}">
+                <div class="log-entry-main">
+                    <div class="log-entry-topline">
+                        <span class="log-kind-chip">${escapeHtml(kindLabel)}</span>
+                        <span class="log-status-badge log-status-${escapeHtml(statusMeta.className)}">${escapeHtml(statusMeta.label)}</span>
+                        <time>${escapeHtml(formatLogTime(entry.updated_at || entry.finished_at || entry.started_at))}</time>
+                    </div>
+                    <h3>${escapeHtml(title)}</h3>
+                    <p>${escapeHtml(getLogSummary(entry))}</p>
+                    <div class="log-pill-row">${pills}</div>
+                </div>
+                <button type="button" class="button log-detail-button" data-log-entry-id="${escapeAttr(entry.id || "")}">查看详细</button>
+            </article>
+        `;
+    }
+
+    function renderLogs(entries) {
+        if (!logsContent) return;
+        latestLogEntries = [...entries].reverse();
+        if (!latestLogEntries.length) {
+            logsContent.innerHTML = `<div class="logs-empty-state">暂无日志。发起请求或执行管理操作后会显示在这里。</div>`;
+            return;
+        }
+        logsContent.innerHTML = latestLogEntries.map(renderLogEntry).join("");
+    }
+
+    function detailKeyValueRows(rows) {
+        return rows
+            .filter(([, value]) => value !== null && value !== undefined && value !== "" && value !== "--")
+            .map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(formatLogValue(value))}</dd></div>`)
+            .join("");
+    }
+
+    function formatResponseBody(entry) {
+        const body = entry.response_body;
+        if (!body) {
+            return entry.response_summary
+                ? `${entry.response_summary}\n\n（该条目只有响应摘要，通常表示请求尚未产生完整响应体或被客户端提前取消。）`
+                : "该条目没有可展示的响应体。";
+        }
+        if (entry.response_body_type === "json" || typeof body === "string") {
+            try {
+                return JSON.stringify(typeof body === "string" ? JSON.parse(body) : body, null, 2);
+            } catch (err) {
+                return String(body);
+            }
+        }
+        return formatLogValue(body);
+    }
+
+    function renderTimeline(entry) {
+        const events = Array.isArray(entry.events) ? entry.events : [];
+        if (!events.length) return `<p class="log-detail-muted">暂无生命周期事件。</p>`;
+        return `
+            <ol class="log-timeline">
+                ${events.map(event => `
+                    <li>
+                        <span>${escapeHtml(formatLogTime(event.time))}</span>
+                        <strong>${escapeHtml(event.label || event.type || "事件")}</strong>
+                        <p>${escapeHtml(event.message || event.raw || "")}</p>
+                    </li>
+                `).join("")}
+            </ol>
+        `;
+    }
+
+    function renderRelatedAttempts(entry) {
+        if (!entry.parent_request_id) return "";
+        const related = latestLogEntries.filter(item => item.kind === "attempt" && item.parent_request_id === entry.parent_request_id);
+        if (related.length <= 1) return "";
+        return `
+            <section class="log-detail-section">
+                <h4>同一下游请求的上游尝试链</h4>
+                <div class="log-related-list">
+                    ${related.slice().reverse().map(item => {
+                        const meta = getLogStatusMeta(item);
+                        return `<span class="log-related-item log-status-${escapeHtml(meta.className)}">#${escapeHtml(item.attempt_current || "?")} ${escapeHtml(item.config_id || "未知配置")} · ${escapeHtml(meta.label)}</span>`;
+                    }).join("")}
+                </div>
+            </section>
+        `;
+    }
+
+    function renderImageLinks(entry) {
+        const urls = Array.isArray(entry.image_urls) ? entry.image_urls : [];
+        if (!urls.length) return "";
+        return `
+            <section class="log-detail-section">
+                <h4>图片链接</h4>
+                <div class="log-image-links">
+                    ${urls.map((url, index) => `<a href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">图片 ${index + 1}</a>`).join("")}
+                </div>
+            </section>
+        `;
+    }
+
+    function openLogDetail(entryId) {
+        const entry = latestLogEntries.find(item => String(item.id) === String(entryId));
+        if (!entry || !logDetailModal || !logDetailBody) return;
+        const statusMeta = getLogStatusMeta(entry);
+        const title = entry.title || entry.status_label || (entry.kind === "attempt" ? "上游请求详情" : "系统事件详情");
+        logDetailTitle.textContent = title;
+        logDetailSubtitle.textContent = `${statusMeta.label} · ${formatLogTime(entry.started_at)} → ${formatLogTime(entry.finished_at || entry.updated_at)}`;
+
+        const overviewRows = entry.kind === "attempt" ? [
+            ["Attempt ID", entry.id],
+            ["下游请求 ID", entry.parent_request_id],
+            ["方案", entry.scheme_name],
+            ["配置项 ID", entry.config_id],
+            ["优先级", entry.priority],
+            ["尝试序号", entry.attempt_current && entry.attempt_total ? `${entry.attempt_current}/${entry.attempt_total}` : "--"],
+            ["最大重试", entry.max_retries],
+            ["请求模式", LOG_MODE_LABELS[entry.mode] || entry.mode],
+            ["Endpoint 预设", entry.endpoint_preset],
+            ["流式策略", entry.strategy],
+            ["上游 URL", entry.upstream_url],
+            ["HTTP 状态", entry.http_status],
+            ["耗时", formatDuration(entry.duration_ms)],
+            ["输入 Token", entry.prompt_tokens],
+            ["输出 Token", entry.completion_tokens],
+            ["总 Token", entry.total_tokens],
+            ["缓存 Token", entry.cached_tokens],
+            ["响应 ID", entry.response_id],
+            ["响应模型", entry.response_model],
+            ["任务 ID", entry.task_id],
+            ["轮询 URL", entry.poll_url],
+            ["错误类型", entry.error_type],
+            ["错误信息", entry.error_message]
+        ] : [
+            ["事件 ID", entry.id],
+            ["事件类型", entry.event_type],
+            ["状态", entry.status_label || entry.status],
+            ["消息", entry.message],
+            ["时间", formatLogTime(entry.started_at || entry.updated_at)]
+        ];
+
+        const rawLogs = Array.isArray(entry.raw_logs) && entry.raw_logs.length ? entry.raw_logs.join("\n") : "没有原始日志。";
+        logDetailBody.innerHTML = `
+            <section class="log-detail-section">
+                <h4>概览字段</h4>
+                <dl class="log-detail-grid">${detailKeyValueRows(overviewRows)}</dl>
+            </section>
+            ${renderRelatedAttempts(entry)}
+            <section class="log-detail-section">
+                <h4>状态时间线</h4>
+                ${renderTimeline(entry)}
+            </section>
+            ${renderImageLinks(entry)}
+            <section class="log-detail-section">
+                <h4>响应详情</h4>
+                <pre class="log-response-code">${escapeHtml(formatResponseBody(entry))}</pre>
+            </section>
+            <section class="log-detail-section">
+                <h4>原始日志</h4>
+                <pre class="log-raw-code">${escapeHtml(rawLogs)}</pre>
+            </section>
+        `;
+        if (logDetailModal.parentElement !== document.body) {
+            document.body.appendChild(logDetailModal);
+        }
+        logDetailModal.classList.remove("hidden");
+        logDetailModal.scrollTop = 0;
+        logDetailBody.scrollTop = 0;
+        document.body.classList.add("modal-open");
+    }
+
+    function closeLogDetail() {
+        if (!logDetailModal) return;
+        logDetailModal.classList.add("hidden");
+        document.body.classList.remove("modal-open");
+    }
+
     async function loadLogs() {
         try {
             const response = await authedFetch("/admin/logs");
             if (!response || !response.ok) return;
-            const logs = await response.json();
-            logsContent.textContent = logs.reverse().join("\n");
+            const payload = await response.json();
+            renderLogs(normalizeLogPayload(payload));
         } catch (err) {
             console.error("加载日志失败:", err);
-        }
-    }
-
-    async function loadLogSettings() {
-        if (!toggleFullRequestLogCheckbox) return;
-        try {
-            const response = await authedFetch("/admin/settings/logs");
-            if (!response || !response.ok) return;
-            const settings = await response.json();
-            isSyncingLogToggle = true;
-            toggleFullRequestLogCheckbox.checked = !!settings.show_full_response_body;
-            if (fullRequestLogStatus) {
-                fullRequestLogStatus.textContent = settings.show_full_response_body ? "当前：已开启" : "当前：已关闭";
+            if (logsContent) {
+                logsContent.innerHTML = `<div class="logs-empty-state logs-empty-error">加载日志失败：${escapeHtml(err.message)}</div>`;
             }
-        } catch (err) {
-            console.error("加载日志设置失败:", err);
-        } finally {
-            isSyncingLogToggle = false;
-        }
-    }
-
-    async function updateLogSettings(enabled) {
-        if (!toggleFullRequestLogCheckbox) return;
-        try {
-            const response = await authedFetch("/admin/settings/logs", {
-                method: "PUT",
-                body: JSON.stringify({ show_full_response_body: !!enabled })
-            });
-            if (!response || !response.ok) {
-                throw new Error(`HTTP error! status: ${response?.status}`);
-            }
-            const updated = await response.json();
-            isSyncingLogToggle = true;
-            toggleFullRequestLogCheckbox.checked = !!updated.show_full_response_body;
-            if (fullRequestLogStatus) {
-                fullRequestLogStatus.textContent = updated.show_full_response_body ? "当前：已开启" : "当前：已关闭";
-            }
-        } catch (err) {
-            console.error("更新日志设置失败:", err);
-            alert(`更新日志设置失败: ${err.message}`);
-            await loadLogSettings();
-        } finally {
-            isSyncingLogToggle = false;
         }
     }
 
@@ -1162,6 +1427,7 @@ document.addEventListener("DOMContentLoaded", () => {
     function formatEndpointPreset(preset) {
         const normalized = preset || "chat_completions";
         if (normalized === "images_generations") return "Images Generations (/images/generations)";
+        if (normalized === "anthropic_messages") return "Anthropic Messages (/messages)";
         return "Chat Completions (/chat/completions)";
     }
 
@@ -1426,13 +1692,28 @@ document.addEventListener("DOMContentLoaded", () => {
                 setModelQueryStatus(`已选择模型: ${modelPickerSelect.value}`, false);
             }
         });
-        if (toggleFullRequestLogCheckbox) {
-            toggleFullRequestLogCheckbox.addEventListener("change", async (e) => {
-                if (isSyncingLogToggle) return;
-                await updateLogSettings(e.target.checked);
+        if (logsContent) {
+            logsContent.addEventListener("click", (e) => {
+                const detailButton = e.target.closest(".log-detail-button");
+                if (!detailButton) return;
+                openLogDetail(detailButton.dataset.logEntryId);
             });
         }
-
+        if (logDetailModal) {
+            if (logDetailModal.parentElement !== document.body) {
+                document.body.appendChild(logDetailModal);
+            }
+            logDetailModal.addEventListener("click", (e) => {
+                if (e.target.closest("[data-log-detail-close]")) {
+                    closeLogDetail();
+                }
+            });
+            document.addEventListener("keydown", (e) => {
+                if (e.key === "Escape" && !logDetailModal.classList.contains("hidden")) {
+                    closeLogDetail();
+                }
+            });
+        }
         renderPresetTable();
         resetForm();
 

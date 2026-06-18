@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 
 from endpoint_presets import (
     EndpointPresetError,
+    build_anthropic_request_plan,
     build_images_request_plan,
     convert_response_base64_images_to_urls,
     normalize_image_response_urls,
@@ -37,6 +38,15 @@ from anthropic_adapter import (
     openai_chat_to_anthropic_response,
     openai_error_to_anthropic,
     openai_json_to_anthropic_stream,
+)
+from anthropic_upstream_adapter import (
+    AnthropicToOpenAISSEConverter,
+    anthropic_response_to_openai_chat,
+    anthropic_response_to_openai_stream_events,
+    convert_anthropic_sse_bytes_to_non_stream_json,
+    convert_anthropic_stream_events_to_response,
+    openai_chat_to_anthropic_request,
+    openai_injected_message_to_anthropic_fragment,
 )
 
 # --- 1. 全局配置和初始化 ---
@@ -79,9 +89,9 @@ os.makedirs(GENERATED_IMAGES_DIR, exist_ok=True)
 
 # 内存日志 (deque 是线程/异步安全的)
 log_deque = collections.deque(maxlen=200)
-
-# 日志显示配置
-show_full_response_body = False
+# 结构化实时日志：一条 attempt 代表一次真实向上游发出的请求；system 代表管理/认证/系统事件
+structured_log_deque = collections.deque(maxlen=200)
+structured_log_lock = RLock()
 
 # 异步文件读写锁
 file_lock = asyncio.Lock()
@@ -114,7 +124,7 @@ app = FastAPI(
 
 UserAgentMode = Literal["external", "aggregator", "claude_code", "sillytavern", "custom"]
 InjectionPosition = Literal["prepend", "append"]
-EndpointPreset = Literal["chat_completions", "images_generations"]
+EndpointPreset = Literal["chat_completions", "images_generations", "anthropic_messages"]
 ImageUpstreamMode = Literal[
     "openai_edit_image",
     "generation_images_array",
@@ -150,7 +160,7 @@ class ApiConfigBase(BaseModel):
     )
     endpoint_preset: Optional[EndpointPreset] = Field(
         "chat_completions",
-        description="预设端点：chat_completions=/chat/completions，images_generations=/images/generations"
+        description="预设端点：chat_completions=/chat/completions，images_generations=/images/generations，anthropic_messages=/messages"
     )
     image_upstream_mode: Optional[ImageUpstreamMode] = Field(
         "generation_reference_images_array",
@@ -179,11 +189,6 @@ class ApiConfig(ApiConfigBase):
 class ApiConfigCreate(ApiConfigBase):
     """用于创建配置项的 Pydantic 模型，增加了 scheme_name"""
     scheme_name: str = Field("default", description="配置项所属的方案名称")
-
-
-class LogSettingsUpdate(BaseModel):
-    """日志展示设置"""
-    show_full_response_body: bool = Field(..., description="是否在日志中显示完整响应体")
 
 
 class UpstreamModelQueryRequest(BaseModel):
@@ -248,12 +253,263 @@ def sanitize_log_text(value: Any) -> str:
     return text
 
 
-def log_message(message: str):
-    """向内存日志队列中添加一条日志"""
-    now = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
+def _log_now_parts() -> tuple[str, str, float]:
+    now_dt = beijing_now()
+    return now_dt.strftime("%Y-%m-%d %H:%M:%S"), now_dt.isoformat(), time.time()
+
+
+def _classify_system_log(message: str) -> tuple[str, str, str]:
+    """把非上游请求日志归类成轻量系统事件，供前端条目式展示。"""
+    text = str(message or "")
+    if "认证失败" in text or "封禁" in text or "ADMIN_KEY 未设置" in text:
+        return "security", "warning", "安全事件"
+    if text.startswith("管理:"):
+        return "admin", "info", "管理事件"
+    if "熔断" in text or "跳过" in text or "均尝试失败" in text or "没有任何 API 配置" in text:
+        return "circuit", "warning", "熔断/路由事件"
+    if "失败" in text or "错误" in text or "异常" in text:
+        return "error", "failed", "系统错误"
+    if "启动" in text or "关闭" in text or "初始化" in text or text.startswith("="):
+        return "runtime", "info", "运行事件"
+    return "system", "info", "系统事件"
+
+
+def _append_structured_system_event(raw_line: str, message: str, timestamp_iso: str, timestamp_epoch: float):
+    event_type, status, title = _classify_system_log(message)
+    entry = {
+        "kind": "system",
+        "id": f"sys-{uuid.uuid4().hex[:12]}",
+        "status": status,
+        "status_label": title,
+        "event_type": event_type,
+        "title": title,
+        "message": message,
+        "started_at": timestamp_iso,
+        "updated_at": timestamp_iso,
+        "finished_at": timestamp_iso,
+        "duration_ms": 0,
+        "raw_logs": [raw_line],
+        "events": [{
+            "time": timestamp_iso,
+            "type": event_type,
+            "label": title,
+            "message": message,
+            "raw": raw_line
+        }],
+        "_started_epoch": timestamp_epoch
+    }
+    with structured_log_lock:
+        structured_log_deque.append(entry)
+
+
+def log_message(message: str, emit_system_event: bool = True) -> str:
+    """向内存日志队列中添加一条原始日志；必要时同步写入结构化系统事件。"""
+    now_display, now_iso, now_epoch = _log_now_parts()
     safe_message = sanitize_log_text(message)
-    log_deque.append(f"[{now}] {safe_message}")
+    raw_line = f"[{now_display}] {safe_message}"
+    log_deque.append(raw_line)
     print(safe_message)  # 同时也打印到控制台
+    if emit_system_event:
+        _append_structured_system_event(raw_line, safe_message, now_iso, now_epoch)
+    return raw_line
+
+
+def _short_log_text(value: Any, limit: int = 240) -> str:
+    text = sanitize_log_text(value)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _collect_image_urls(value: Any, output: Optional[List[str]] = None) -> List[str]:
+    output = output if output is not None else []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"url", "image_url"} and isinstance(item, str) and (item.startswith("http://") or item.startswith("https://") or item.startswith("/")):
+                output.append(item)
+            else:
+                _collect_image_urls(item, output)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_image_urls(item, output)
+    elif isinstance(value, str):
+        for match in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", value):
+            output.append(match)
+    return list(dict.fromkeys(output))
+
+
+def _extract_response_observations(payload: Any) -> Dict[str, Any]:
+    parsed = payload
+    if isinstance(payload, str):
+        try:
+            parsed = json.loads(payload)
+        except Exception:
+            parsed = None
+
+    summary: Dict[str, Any] = {}
+    if isinstance(parsed, dict):
+        summary["response_id"] = parsed.get("id")
+        summary["response_object"] = parsed.get("object")
+        summary["model"] = parsed.get("model")
+        usage = parsed.get("usage") if isinstance(parsed.get("usage"), dict) else {}
+        summary["prompt_tokens"] = usage.get("prompt_tokens")
+        summary["completion_tokens"] = usage.get("completion_tokens")
+        summary["total_tokens"] = extract_total_tokens(parsed)
+        summary["cached_tokens"] = extract_cached_tokens(parsed)
+        summary["image_urls"] = _collect_image_urls(parsed)
+    return summary
+
+
+def _serialize_structured_log_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: copy.deepcopy(value) for key, value in entry.items() if not key.startswith("_")}
+
+
+def create_upstream_attempt_log(
+        parent_request_id: str,
+        scheme_name: str,
+        config: "ApiConfig",
+        attempt_no: int,
+        attempt_total: int,
+        mode: str,
+        endpoint_preset: str,
+        strategy: str,
+        upstream_url: str
+) -> Dict[str, Any]:
+    now_display, now_iso, now_epoch = _log_now_parts()
+    attempt_id = f"att-{uuid.uuid4().hex[:12]}"
+    title = f"第 {attempt_no}/{attempt_total} 次上游请求准备发送"
+    entry = {
+        "kind": "attempt",
+        "id": attempt_id,
+        "parent_request_id": parent_request_id,
+        "status": "pending",
+        "status_label": "准备发送",
+        "title": title,
+        "started_at": now_iso,
+        "updated_at": now_iso,
+        "finished_at": None,
+        "duration_ms": None,
+        "scheme_name": scheme_name,
+        "config_id": config.id,
+        "priority": config.priority,
+        "max_retries": max(0, attempt_total - 1),
+        "attempt_current": attempt_no,
+        "attempt_total": attempt_total,
+        "mode": mode,
+        "endpoint_preset": endpoint_preset,
+        "http_status": None,
+        "strategy": strategy,
+        "upstream_url": upstream_url,
+        "total_tokens": None,
+        "cached_tokens": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "response_id": None,
+        "response_object": None,
+        "response_model": None,
+        "response_body": None,
+        "response_body_type": None,
+        "response_summary": None,
+        "image_urls": [],
+        "task_id": None,
+        "poll_url": None,
+        "error_type": None,
+        "error_message": None,
+        "next_attempt": None,
+        "raw_logs": [],
+        "events": [],
+        "_started_epoch": now_epoch
+    }
+    with structured_log_lock:
+        structured_log_deque.append(entry)
+    add_attempt_log_event(
+        entry,
+        "prepare",
+        f"正在尝试方案 '{scheme_name}' 的配置项 ID: {config.id} (Priority: {config.priority}, MaxRetries: {attempt_total - 1})",
+        status="pending",
+        status_label="准备发送",
+        title=title
+    )
+    return entry
+
+
+def add_attempt_log_event(
+        entry: Optional[Dict[str, Any]],
+        event_type: str,
+        message: str,
+        *,
+        status: Optional[str] = None,
+        status_label: Optional[str] = None,
+        title: Optional[str] = None,
+        finish: bool = False,
+        **fields: Any
+) -> Optional[str]:
+    if entry is None:
+        return None
+    raw_line = log_message(message, emit_system_event=False)
+    _, now_iso, now_epoch = _log_now_parts()
+    with structured_log_lock:
+        entry["updated_at"] = now_iso
+        if status:
+            entry["status"] = status
+        if status_label:
+            entry["status_label"] = status_label
+        if title:
+            entry["title"] = title
+        for key, value in fields.items():
+            if value is not None:
+                entry[key] = value
+        if finish or status in {"success", "failed", "cancelled", "retried"}:
+            entry["finished_at"] = entry.get("finished_at") or now_iso
+            entry["duration_ms"] = int(max(0, now_epoch - float(entry.get("_started_epoch") or now_epoch)) * 1000)
+        entry.setdefault("raw_logs", []).append(raw_line)
+        entry.setdefault("events", []).append({
+            "time": now_iso,
+            "type": event_type,
+            "label": status_label or title or event_type,
+            "message": message,
+            "raw": raw_line
+        })
+    return raw_line
+
+
+def attach_attempt_response_body(entry: Optional[Dict[str, Any]], payload: Any, fallback_text: Optional[str] = None):
+    if entry is None:
+        return
+    observations = _extract_response_observations(payload)
+    body_text = fallback_text
+    body_type = "text"
+    if body_text is None:
+        try:
+            body_text = json.dumps(payload, ensure_ascii=False) if not isinstance(payload, str) else payload
+            if isinstance(payload, (dict, list)):
+                body_type = "json"
+            else:
+                json.loads(body_text)
+                body_type = "json"
+        except Exception:
+            body_text = str(payload)
+            body_type = "text"
+    body_text = sanitize_log_text(body_text)
+    fields = {
+        "response_body": body_text,
+        "response_body_type": body_type,
+        "response_summary": _short_log_text(body_text, 320),
+        "response_id": observations.get("response_id"),
+        "response_object": observations.get("response_object"),
+        "response_model": observations.get("model"),
+        "prompt_tokens": observations.get("prompt_tokens"),
+        "completion_tokens": observations.get("completion_tokens"),
+        "total_tokens": observations.get("total_tokens"),
+        "cached_tokens": observations.get("cached_tokens"),
+        "image_urls": observations.get("image_urls") or entry.get("image_urls") or []
+    }
+    add_attempt_log_event(
+        entry,
+        "response_body",
+        f"响应体完整内容: {body_text}",
+        status=entry.get("status"),
+        status_label=entry.get("status_label"),
+        **fields
+    )
 
 
 async def read_json_file(file_path: str, default_data: Any) -> Any:
@@ -1423,28 +1679,8 @@ async def resolve_images_response_with_auto_poll(
     raise EndpointPresetError(f"图片任务 {task_id} 等待超时 ({timeout_seconds}s)，最后响应: {excerpt}")
 
 
-def convert_sse_bytes_to_non_stream_json(sse_bytes: bytes) -> Dict[str, Any]:
-    """将 SSE 流完整聚合为一个非流式 OpenAI 兼容响应对象。"""
-    text = sse_bytes.decode("utf-8", errors="ignore")
-    events: List[Dict[str, Any]] = []
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line.startswith("data:"):
-            continue
-
-        payload = line[5:].strip()
-        if not payload or payload == "[DONE]":
-            continue
-
-        try:
-            obj = json.loads(payload)
-        except Exception:
-            continue
-
-        if isinstance(obj, dict):
-            events.append(obj)
-
+def convert_stream_events_to_non_stream_json(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """将已解析的流式事件聚合为最终响应对象；只保留最终结果，不暴露逐 delta 传输碎片。"""
     if not events:
         raise ValueError("流式响应中未解析到有效 data 事件")
 
@@ -1458,11 +1694,51 @@ def convert_sse_bytes_to_non_stream_json(sse_bytes: bytes) -> Dict[str, Any]:
             if isinstance(first_choice, dict) and "message" in first_choice:
                 return obj
 
+    def append_text_field(state: Dict[str, Any], field_name: str, value: Any):
+        if isinstance(value, str):
+            state[field_name] = state.get(field_name, "") + value
+
+    def set_text_field(state: Dict[str, Any], field_name: str, value: Any):
+        if isinstance(value, str):
+            state[field_name] = value
+
+    def merge_tool_calls(state: Dict[str, Any], tool_calls: Any):
+        if not isinstance(tool_calls, list):
+            return
+        tool_call_map = state.setdefault("tool_calls", {})
+        for fallback_index, fragment in enumerate(tool_calls):
+            if not isinstance(fragment, dict):
+                continue
+            idx = fragment.get("index", fallback_index)
+            if not isinstance(idx, int):
+                idx = fallback_index
+            merged = tool_call_map.setdefault(idx, {"index": idx})
+            for key in ("id", "type"):
+                value = fragment.get(key)
+                if isinstance(value, str) and value:
+                    merged[key] = value
+            function_fragment = fragment.get("function")
+            if isinstance(function_fragment, dict):
+                merged_function = merged.setdefault("function", {})
+                name = function_fragment.get("name")
+                if isinstance(name, str) and name:
+                    merged_function["name"] = name
+                arguments = function_fragment.get("arguments")
+                if isinstance(arguments, str):
+                    merged_function["arguments"] = merged_function.get("arguments", "") + arguments
+
     first_obj = events[0]
+    response_id = None
+    response_model = None
     usage_obj = None
     choices_acc: Dict[int, Dict[str, Any]] = {}
 
     for obj in events:
+        if isinstance(obj.get("id"), str) and obj.get("id"):
+            response_id = obj.get("id")
+        if isinstance(obj.get("model"), str) and obj.get("model"):
+            response_model = obj.get("model")
+
         usage_candidate = obj.get("usage")
         if isinstance(usage_candidate, dict):
             usage_obj = usage_candidate
@@ -1491,20 +1767,23 @@ def convert_sse_bytes_to_non_stream_json(sse_bytes: bytes) -> Dict[str, Any]:
                 role = delta.get("role")
                 if isinstance(role, str) and role:
                     state["role"] = role
-
-                content_piece = delta.get("content")
-                if isinstance(content_piece, str):
-                    state["content"] += content_piece
+                append_text_field(state, "content", delta.get("content"))
+                append_text_field(state, "reasoning_content", delta.get("reasoning_content"))
+                append_text_field(state, "reasoning", delta.get("reasoning"))
+                append_text_field(state, "refusal", delta.get("refusal"))
+                merge_tool_calls(state, delta.get("tool_calls"))
 
             message = choice.get("message")
             if isinstance(message, dict):
                 role = message.get("role")
                 if isinstance(role, str) and role:
                     state["role"] = role
-
-                content = message.get("content")
-                if isinstance(content, str):
-                    state["content"] = content
+                set_text_field(state, "content", message.get("content"))
+                set_text_field(state, "reasoning_content", message.get("reasoning_content"))
+                set_text_field(state, "reasoning", message.get("reasoning"))
+                set_text_field(state, "refusal", message.get("refusal"))
+                if isinstance(message.get("tool_calls"), list):
+                    state["tool_calls"] = {i: copy.deepcopy(item) for i, item in enumerate(message["tool_calls"]) if isinstance(item, dict)}
 
             finish_reason = choice.get("finish_reason")
             if finish_reason is not None:
@@ -1516,20 +1795,26 @@ def convert_sse_bytes_to_non_stream_json(sse_bytes: bytes) -> Dict[str, Any]:
     output_choices = []
     for idx in sorted(choices_acc.keys()):
         state = choices_acc[idx]
+        message = {
+            "role": state["role"],
+            "content": state.get("content", "")
+        }
+        for optional_field in ("reasoning_content", "reasoning", "refusal"):
+            if state.get(optional_field):
+                message[optional_field] = state[optional_field]
+        if isinstance(state.get("tool_calls"), dict) and state["tool_calls"]:
+            message["tool_calls"] = [state["tool_calls"][key] for key in sorted(state["tool_calls"].keys())]
         output_choices.append({
             "index": state["index"],
-            "message": {
-                "role": state["role"],
-                "content": state["content"]
-            },
+            "message": message,
             "finish_reason": state["finish_reason"]
         })
 
     result = {
-        "id": first_obj.get("id") or f"chatcmpl-{uuid.uuid4().hex}",
+        "id": response_id or first_obj.get("id") or f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
         "created": first_obj.get("created") if isinstance(first_obj.get("created"), int) else int(beijing_now().timestamp()),
-        "model": first_obj.get("model"),
+        "model": response_model or first_obj.get("model"),
         "choices": output_choices
     }
 
@@ -1537,6 +1822,31 @@ def convert_sse_bytes_to_non_stream_json(sse_bytes: bytes) -> Dict[str, Any]:
         result["usage"] = usage_obj
 
     return result
+
+
+def convert_sse_bytes_to_non_stream_json(sse_bytes: bytes) -> Dict[str, Any]:
+    """将 SSE 流完整聚合为一个非流式 OpenAI 兼容响应对象。"""
+    text = sse_bytes.decode("utf-8", errors="ignore")
+    events: List[Dict[str, Any]] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+
+        if isinstance(obj, dict):
+            events.append(obj)
+
+    return convert_stream_events_to_non_stream_json(events)
 
 
 @app.post("/v1/chat/completions", tags=["Proxy"])
@@ -1623,6 +1933,7 @@ async def proxy_chat_completions(
     # --- 3. 循环尝试队列 ---
     last_error = None
     last_error_response = None
+    parent_request_id = f"req-{uuid.uuid4().hex[:12]}"
 
     for config in attempt_queue:
         try:
@@ -1634,9 +1945,6 @@ async def proxy_chat_completions(
         max_retries = config.max_retries if config.max_retries is not None else 0
         if max_retries < 0:
             max_retries = 0
-
-        log_message(
-            f"正在尝试方案 '{scheme_name}' 的配置项 ID: {config.id} (Priority: {config.priority}, MaxRetries: {max_retries})")
 
         # 查找原始分组信息，用于成功后更新轮询状态
         original_group = priority_groups.get(config.priority, [])
@@ -1669,6 +1977,9 @@ async def proxy_chat_completions(
 
         for attempt_no in range(max_retries + 1):
             response_context = None
+            attempt_entry = None
+            current_attempt = attempt_no + 1
+            attempt_total = max_retries + 1
             try:
                 await ensure_client_connected()
             except ClientRequestAborted as e:
@@ -1702,11 +2013,35 @@ async def proxy_chat_completions(
                 if config.endpoint_preset == "images_generations":
                     images_path, images_body = build_images_request_plan(proxy_body, config)
                     images_proxy_url = f"{upstream_base_url.rstrip('/')}{images_path}"
+                    attempt_entry = create_upstream_attempt_log(
+                        parent_request_id,
+                        scheme_name,
+                        config,
+                        current_attempt,
+                        attempt_total,
+                        "images_fake_stream" if request_body.get("stream", False) else "images",
+                        "images_generations",
+                        mode_plan["mode_label"],
+                        images_proxy_url
+                    )
                     images_headers = dict(proxy_headers)
                     images_headers["Accept"] = "application/json"
                     if request_body.get("stream", False):
-                        log_message(f"配置项 ID: {config.id} 使用 images_generations 预设，上游按非流式请求，向下游返回 fake SSE 图片 markdown")
+                        add_attempt_log_event(
+                            attempt_entry,
+                            "preset",
+                            f"配置项 ID: {config.id} 使用 images_generations 预设，上游按非流式请求，向下游返回 fake SSE 图片 markdown",
+                            status="pending",
+                            status_label="图片预设准备"
+                        )
 
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "send",
+                        f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Images 预设请求已发送 (path={images_path})",
+                        status="pending",
+                        status_label="已发送"
+                    )
                     is_standard_openai_edit = config.image_upstream_mode == "openai_edit_image" and images_path.rstrip("/").endswith("/images/edits") and isinstance(images_body.get("image"), str)
                     if is_standard_openai_edit:
                         multipart_headers = dict(images_headers)
@@ -1729,7 +2064,16 @@ async def proxy_chat_completions(
                         if image_task_accepted:
                             return
                         image_task_accepted = True
-                        log_message(f"配置项 ID: {config.id} Images 任务已被上游接受 (task_id={task_id})，提前推进配置项轮询，查询地址: {poll_url}")
+                        add_attempt_log_event(
+                            attempt_entry,
+                            "image_task_accepted",
+                            f"配置项 ID: {config.id} Images 任务已被上游接受 (task_id={task_id})，提前推进配置项轮询，查询地址: {poll_url}",
+                            status="image_pending",
+                            status_label="图片处理中",
+                            title="Images 任务已接受",
+                            task_id=task_id,
+                            poll_url=poll_url
+                        )
                         await advance_round_robin_state_only(config, scheme_name, original_group, success_index_in_group)
 
                     response_json = await resolve_images_response_with_auto_poll(
@@ -1758,13 +2102,21 @@ async def proxy_chat_completions(
                         image_saver=save_decoded_image_to_memory
                     )
 
-                    if show_full_response_body:
-                        try:
-                            log_message(f"响应体完整内容: {json.dumps(wrapped_json, ensure_ascii=False)}")
-                        except Exception:
-                            log_message(f"响应体完整内容(序列化失败，使用字符串): {str(wrapped_json)}")
+                    attach_attempt_response_body(attempt_entry, wrapped_json)
 
-                    log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次 Images 预设请求成功 (path={images_path})")
+                    image_urls = _collect_image_urls(wrapped_json)
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "success",
+                        f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Images 预设请求成功 (path={images_path})",
+                        status="success",
+                        status_label="图片成功" if image_urls else "Images 成功",
+                        title="Images 预设请求成功",
+                        finish=True,
+                        http_status=response.status_code,
+                        image_urls=image_urls,
+                        total_tokens=extract_total_tokens(wrapped_json)
+                    )
                     await update_stats_and_state(
                         config,
                         True,
@@ -1809,8 +2161,321 @@ async def proxy_chat_completions(
 
                     return JSONResponse(content=wrapped_json, status_code=response.status_code)
 
+                if config.endpoint_preset == "anthropic_messages":
+                    anthropic_body = openai_chat_to_anthropic_request(proxy_body)
+                    anthropic_body["stream"] = upstream_is_stream
+                    anthropic_path, anthropic_body = build_anthropic_request_plan(anthropic_body, config, source_protocol="openai")
+                    anthropic_proxy_url = f"{upstream_base_url.rstrip('/')}{anthropic_path}"
+                    anthropic_headers = {
+                        "x-api-key": upstream_api_key,
+                        "anthropic-version": request.headers.get("anthropic-version") or "2023-06-01",
+                        "Content-Type": "application/json",
+                        "Accept": "text/event-stream" if upstream_is_stream else "application/json"
+                    }
+                    anthropic_beta = request.headers.get("anthropic-beta")
+                    if anthropic_beta:
+                        anthropic_headers["anthropic-beta"] = anthropic_beta
+                    apply_user_agent_header(
+                        anthropic_headers,
+                        config.user_agent_mode,
+                        config.custom_user_agent,
+                        request.headers.get("user-agent")
+                    )
+
+                    if upstream_is_stream and downstream_is_stream:
+                        attempt_mode = "anthropic_stream"
+                    elif upstream_is_stream and not downstream_is_stream:
+                        attempt_mode = "anthropic_fake_non_stream"
+                    elif not upstream_is_stream and downstream_is_stream:
+                        attempt_mode = "anthropic_fake_stream"
+                    else:
+                        attempt_mode = "anthropic_non_stream"
+
+                    attempt_entry = create_upstream_attempt_log(
+                        parent_request_id,
+                        scheme_name,
+                        config,
+                        current_attempt,
+                        attempt_total,
+                        attempt_mode,
+                        "anthropic_messages",
+                        mode_plan["mode_label"],
+                        anthropic_proxy_url
+                    )
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "send",
+                        f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic Messages 上游请求已发送 (mode={attempt_mode}, 策略={mode_plan['mode_label']})",
+                        status="pending",
+                        status_label="已发送"
+                    )
+
+                    if upstream_is_stream:
+                        response_context = httpx_client.stream("POST", anthropic_proxy_url, headers=anthropic_headers, json=anthropic_body)
+                        response = await response_context.__aenter__()
+
+                        if response.status_code >= 400:
+                            response_body = await response.aread()
+                            error_text = response_body.decode("utf-8", errors="ignore")
+                            safe_error_text = sanitize_log_text(error_text)
+                            add_attempt_log_event(
+                                attempt_entry,
+                                "failed",
+                                f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic 上游失败 (HTTP {response.status_code}): {safe_error_text}",
+                                status="failed",
+                                status_label="HTTP 失败",
+                                title="Anthropic 流式上游返回错误",
+                                finish=True,
+                                http_status=response.status_code,
+                                error_type="HTTPStatusError",
+                                error_message=safe_error_text
+                            )
+                            attach_attempt_response_body(attempt_entry, safe_error_text, safe_error_text)
+                            last_error = f"HTTP {response.status_code}: {safe_error_text}"
+
+                            class AnthropicMockResponse:
+                                def __init__(self, content, status_code_val):
+                                    self._content, self.status_code = content, status_code_val
+
+                                def json(self):
+                                    return self._content if isinstance(self._content, dict) else {"error": self.text}
+
+                                @property
+                                def text(self):
+                                    return self._content if isinstance(self._content, str) else str(self._content)
+
+                            try:
+                                last_error_response = AnthropicMockResponse(json.loads(error_text), response.status_code)
+                            except Exception:
+                                last_error_response = AnthropicMockResponse(error_text, response.status_code)
+                            await update_stats_and_state(config, False, scheme_name, [], 0)
+                            await response_context.__aexit__(None, None, None)
+                            response_context = None
+                            if attempt_no < max_retries:
+                                add_attempt_log_event(
+                                    attempt_entry,
+                                    "retry_next",
+                                    f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试",
+                                    status="retried",
+                                    status_label="已进入重试",
+                                    title="本次失败，准备重试",
+                                    finish=True,
+                                    next_attempt=attempt_no + 2
+                                )
+                                continue
+                            break
+
+                        if downstream_is_stream:
+                            async def anthropic_to_openai_stream_generator(successful_config, ctx, resp, attempt_log_entry):
+                                pending = bytearray()
+                                converter = AnthropicToOpenAISSEConverter(anthropic_body)
+                                stream_events: List[Dict[str, Any]] = []
+                                total_tokens = None
+                                cached_tokens = None
+                                for event_bytes in converter.start_events():
+                                    yield event_bytes
+
+                                def consume_line(line_text: str):
+                                    nonlocal total_tokens, cached_tokens
+                                    line_text = line_text.strip()
+                                    if not line_text.startswith("data:"):
+                                        return []
+                                    payload = line_text[5:].strip()
+                                    if not payload or payload == "[DONE]":
+                                        return []
+                                    try:
+                                        data_obj = json.loads(payload)
+                                    except Exception:
+                                        return []
+                                    if isinstance(data_obj, dict):
+                                        stream_events.append(data_obj)
+                                        extracted_total = extract_total_tokens(data_obj)
+                                        if extracted_total is not None:
+                                            total_tokens = extracted_total
+                                        extracted_cached = extract_cached_tokens(data_obj)
+                                        if extracted_cached is not None:
+                                            cached_tokens = extracted_cached
+                                        return converter.feed_event(data_obj)
+                                    return []
+
+                                def attach_aggregated_body():
+                                    if not stream_events:
+                                        return
+                                    try:
+                                        anthropic_payload = convert_anthropic_stream_events_to_response(stream_events, anthropic_body)
+                                        merged_payload = anthropic_response_to_openai_chat(anthropic_payload, anthropic_body)
+                                        attach_attempt_response_body(attempt_log_entry, merged_payload)
+                                    except Exception as merge_error:
+                                        add_attempt_log_event(
+                                            attempt_log_entry,
+                                            "stream_response_body_skipped",
+                                            f"Anthropic 流式响应聚合失败: {repr(merge_error)}",
+                                            status=attempt_log_entry.get("status"),
+                                            status_label=attempt_log_entry.get("status_label")
+                                        )
+
+                                try:
+                                    async for chunk in resp.aiter_bytes():
+                                        pending.extend(chunk)
+                                        while b"\n" in pending:
+                                            line_bytes, _, rest = pending.partition(b"\n")
+                                            pending = bytearray(rest)
+                                            for event_bytes in consume_line(line_bytes.decode("utf-8", errors="ignore")):
+                                                yield event_bytes
+                                    if pending:
+                                        for event_bytes in consume_line(pending.decode("utf-8", errors="ignore")):
+                                            yield event_bytes
+                                    for event_bytes in converter.finish_events():
+                                        yield event_bytes
+                                    attach_aggregated_body()
+                                    total_tokens_text = total_tokens if total_tokens is not None else "未知"
+                                    cached_tokens_text = cached_tokens if cached_tokens is not None else "未知"
+                                    add_attempt_log_event(
+                                        attempt_log_entry,
+                                        "stream_finished",
+                                        f"配置项 ID: {successful_config.id} Anthropic 流式请求结束 (total_tokens={total_tokens_text}, cached_tokens={cached_tokens_text})",
+                                        status="success",
+                                        status_label="流式完成",
+                                        title="Anthropic 流式请求完成",
+                                        finish=True,
+                                        total_tokens=total_tokens_text,
+                                        cached_tokens=cached_tokens_text
+                                    )
+                                except Exception as e:
+                                    error_type = type(e).__name__
+                                    add_attempt_log_event(
+                                        attempt_log_entry,
+                                        "stream_failed",
+                                        f"配置项 ID: {successful_config.id} Anthropic 流传输过程中失败: {repr(e)}",
+                                        status="cancelled" if "ClientDisconnect" in error_type or "CancelledError" in error_type else "failed",
+                                        status_label="客户端断开" if "ClientDisconnect" in error_type or "CancelledError" in error_type else "流式失败",
+                                        title="Anthropic 流式传输结束",
+                                        finish=True,
+                                        error_type=error_type,
+                                        error_message=repr(e)
+                                    )
+                                    if "ClientDisconnect" not in error_type and "CancelledError" not in error_type:
+                                        raise
+                                finally:
+                                    await ctx.__aexit__(None, None, None)
+
+                            add_attempt_log_event(
+                                attempt_entry,
+                                "stream_started",
+                                f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic 流式请求启动成功 (HTTP {response.status_code})",
+                                status="streaming",
+                                status_label="流式传输中",
+                                title="Anthropic 流式请求已启动",
+                                http_status=response.status_code
+                            )
+                            await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                            response_context_to_pass = response_context
+                            response_context = None
+                            return StreamingResponse(
+                                anthropic_to_openai_stream_generator(config, response_context_to_pass, response, attempt_entry),
+                                media_type="text/event-stream"
+                            )
+
+                        stream_bytes = await response.aread()
+                        anthropic_payload = convert_anthropic_sse_bytes_to_non_stream_json(stream_bytes, anthropic_body)
+                        response_json = anthropic_response_to_openai_chat(anthropic_payload, anthropic_body)
+                        attach_attempt_response_body(attempt_entry, response_json)
+                        total_tokens = extract_total_tokens(response_json)
+                        cached_tokens = extract_cached_tokens(response_json)
+                        total_tokens_text = total_tokens if total_tokens is not None else "未知"
+                        cached_tokens_text = cached_tokens if cached_tokens is not None else "未知"
+                        add_attempt_log_event(
+                            attempt_entry,
+                            "success",
+                            f"配置项 ID: {config.id} Anthropic 假非流成功 (total_tokens={total_tokens_text}, cached_tokens={cached_tokens_text})",
+                            status="success",
+                            status_label="假非流成功",
+                            title="Anthropic 假非流请求成功",
+                            finish=True,
+                            http_status=response.status_code,
+                            total_tokens=total_tokens_text,
+                            cached_tokens=cached_tokens_text
+                        )
+                        await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                        await response_context.__aexit__(None, None, None)
+                        response_context = None
+                        return JSONResponse(content=response_json, status_code=response.status_code)
+
+                    response = await httpx_client.post(anthropic_proxy_url, headers=anthropic_headers, json=anthropic_body)
+                    response.raise_for_status()
+                    anthropic_payload = response.json()
+                    attach_attempt_response_body(attempt_entry, anthropic_payload)
+
+                    if downstream_is_stream:
+                        async def anthropic_fake_stream_generator(final_payload: Dict[str, Any]):
+                            for event_bytes in anthropic_response_to_openai_stream_events(final_payload, anthropic_body):
+                                yield event_bytes
+
+                        response_json = anthropic_response_to_openai_chat(anthropic_payload, anthropic_body)
+                        total_tokens = extract_total_tokens(response_json)
+                        cached_tokens = extract_cached_tokens(response_json)
+                        add_attempt_log_event(
+                            attempt_entry,
+                            "success",
+                            f"配置项 ID: {config.id} Anthropic 假流式成功 (total_tokens={total_tokens if total_tokens is not None else '未知'}, cached_tokens={cached_tokens if cached_tokens is not None else '未知'})",
+                            status="success",
+                            status_label="假流式成功",
+                            title="Anthropic 假流式请求成功",
+                            finish=True,
+                            http_status=response.status_code,
+                            total_tokens=total_tokens if total_tokens is not None else "未知",
+                            cached_tokens=cached_tokens if cached_tokens is not None else "未知"
+                        )
+                        await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                        return StreamingResponse(anthropic_fake_stream_generator(anthropic_payload), media_type="text/event-stream")
+
+                    response_json = anthropic_response_to_openai_chat(anthropic_payload, anthropic_body)
+                    attach_attempt_response_body(attempt_entry, response_json)
+                    total_tokens = extract_total_tokens(response_json)
+                    cached_tokens = extract_cached_tokens(response_json)
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "success",
+                        f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic 非流式请求成功 (total_tokens={total_tokens if total_tokens is not None else '未知'}, cached_tokens={cached_tokens if cached_tokens is not None else '未知'})",
+                        status="success",
+                        status_label="非流式成功",
+                        title="Anthropic 非流式请求成功",
+                        finish=True,
+                        http_status=response.status_code,
+                        total_tokens=total_tokens if total_tokens is not None else "未知",
+                        cached_tokens=cached_tokens if cached_tokens is not None else "未知"
+                    )
+                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                    return JSONResponse(content=response_json, status_code=response.status_code)
+
                 # 策略强制覆盖 stream，确保上游请求模式与策略一致
                 proxy_body["stream"] = upstream_is_stream
+                if upstream_is_stream and downstream_is_stream:
+                    attempt_mode = "stream"
+                elif upstream_is_stream and not downstream_is_stream:
+                    attempt_mode = "fake_non_stream"
+                elif not upstream_is_stream and downstream_is_stream:
+                    attempt_mode = "fake_stream"
+                else:
+                    attempt_mode = "non_stream"
+                attempt_entry = create_upstream_attempt_log(
+                    parent_request_id,
+                    scheme_name,
+                    config,
+                    current_attempt,
+                    attempt_total,
+                    attempt_mode,
+                    config.endpoint_preset or "chat_completions",
+                    mode_plan["mode_label"],
+                    proxy_url
+                )
+                add_attempt_log_event(
+                    attempt_entry,
+                    "send",
+                    f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次上游请求已发送 (mode={attempt_mode}, 策略={mode_plan['mode_label']})",
+                    status="pending",
+                    status_label="已发送"
+                )
 
                 if upstream_is_stream:
                     response_context = httpx_client.stream("POST", proxy_url, headers=proxy_headers, json=proxy_body)
@@ -1820,11 +2485,20 @@ async def proxy_chat_completions(
                         response_body = await response.aread()
                         error_text = response_body.decode('utf-8')
                         safe_error_text = sanitize_log_text(error_text)
-                        log_message(
-                            f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (HTTP {response.status_code}, 策略={mode_plan['mode_label']}): {safe_error_text}")
+                        add_attempt_log_event(
+                            attempt_entry,
+                            "failed",
+                            f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次失败 (HTTP {response.status_code}, 策略={mode_plan['mode_label']}): {safe_error_text}",
+                            status="failed",
+                            status_label="HTTP 失败",
+                            title="流式上游返回错误",
+                            finish=True,
+                            http_status=response.status_code,
+                            error_type="HTTPStatusError",
+                            error_message=safe_error_text
+                        )
                         last_error = f"HTTP {response.status_code}: {safe_error_text}"
-                        if show_full_response_body:
-                            log_message(f"响应体完整内容: {safe_error_text}")
+                        attach_attempt_response_body(attempt_entry, safe_error_text, safe_error_text)
                         try:
                             error_content = json.loads(error_text)
                         except Exception:
@@ -1855,31 +2529,44 @@ async def proxy_chat_completions(
                         response_context = None
 
                         if attempt_no < max_retries:
-                            log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
+                            add_attempt_log_event(
+                                attempt_entry,
+                                "retry_next",
+                                f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试",
+                                status="retried",
+                                status_label="已进入重试",
+                                title="本次失败，准备重试",
+                                finish=True,
+                                next_attempt=attempt_no + 2
+                            )
                             continue
                         break
 
                     if downstream_is_stream:
-                        async def final_stream_generator(successful_config, ctx, resp):
+                        async def final_stream_generator(successful_config, ctx, resp, attempt_log_entry):
                             pending = bytearray()
+                            stream_events: List[Dict[str, Any]] = []
                             total_tokens = None
                             cached_tokens = None
 
-                            def try_extract_usage_from_sse_line(line_text: str):
+                            def consume_sse_line(line_text: str):
                                 nonlocal total_tokens, cached_tokens
                                 line_text = line_text.strip()
                                 if not line_text.startswith("data:"):
                                     return
 
                                 payload = line_text[5:].strip()
-                                if payload == "[DONE]":
+                                if not payload or payload == "[DONE]":
                                     return
 
                                 try:
                                     data_obj = json.loads(payload)
                                 except Exception:
                                     return
+                                if not isinstance(data_obj, dict):
+                                    return
 
+                                stream_events.append(data_obj)
                                 extracted_total = extract_total_tokens(data_obj)
                                 if extracted_total is not None:
                                     total_tokens = extracted_total
@@ -1887,6 +2574,22 @@ async def proxy_chat_completions(
                                 extracted_cached = extract_cached_tokens(data_obj)
                                 if extracted_cached is not None:
                                     cached_tokens = extracted_cached
+
+                            def attach_aggregated_stream_body():
+                                if not stream_events:
+                                    return
+                                try:
+                                    merged_payload = convert_stream_events_to_non_stream_json(stream_events)
+                                except Exception as merge_error:
+                                    add_attempt_log_event(
+                                        attempt_log_entry,
+                                        "stream_response_body_skipped",
+                                        f"流式响应已收到，但聚合最终结果失败: {repr(merge_error)}",
+                                        status=attempt_log_entry.get("status"),
+                                        status_label=attempt_log_entry.get("status_label")
+                                    )
+                                    return
+                                attach_attempt_response_body(attempt_log_entry, merged_payload)
 
                             try:
                                 async for chunk in resp.aiter_bytes():
@@ -1896,33 +2599,72 @@ async def proxy_chat_completions(
                                     while b"\n" in pending:
                                         line_bytes, _, rest = pending.partition(b"\n")
                                         pending = bytearray(rest)
-                                        try_extract_usage_from_sse_line(line_bytes.decode("utf-8", errors="ignore"))
+                                        consume_sse_line(line_bytes.decode("utf-8", errors="ignore"))
 
                                 if pending:
-                                    try_extract_usage_from_sse_line(pending.decode("utf-8", errors="ignore"))
+                                    consume_sse_line(pending.decode("utf-8", errors="ignore"))
+
+                                attach_aggregated_stream_body()
 
                                 total_tokens_text = total_tokens if total_tokens is not None else "未知"
                                 cached_tokens_text = cached_tokens if cached_tokens is not None else "未知"
-                                log_message(f"配置项 ID: {successful_config.id} 流式请求结束 (total_tokens={total_tokens_text}, cached_tokens={cached_tokens_text}, 策略={mode_plan['mode_label']})")
+                                add_attempt_log_event(
+                                    attempt_log_entry,
+                                    "stream_finished",
+                                    f"配置项 ID: {successful_config.id} 流式请求结束 (total_tokens={total_tokens_text}, cached_tokens={cached_tokens_text}, 策略={mode_plan['mode_label']})",
+                                    status="success",
+                                    status_label="流式完成",
+                                    title="流式请求完成",
+                                    finish=True,
+                                    total_tokens=total_tokens_text,
+                                    cached_tokens=cached_tokens_text
+                                )
                             except Exception as e:
                                 error_type = type(e).__name__
+                                attach_aggregated_stream_body()
                                 if "ClientDisconnect" in error_type or "CancelledError" in error_type:
-                                    log_message(
-                                        f"配置项 ID: {successful_config.id} 流传输被客户端主动断开 (Type: {error_type})")
+                                    add_attempt_log_event(
+                                        attempt_log_entry,
+                                        "stream_cancelled",
+                                        f"配置项 ID: {successful_config.id} 流传输被客户端主动断开 (Type: {error_type})",
+                                        status="cancelled",
+                                        status_label="客户端断开",
+                                        title="流式传输被断开",
+                                        finish=True,
+                                        error_type=error_type,
+                                        error_message=str(e)
+                                    )
                                     return
                                 else:
-                                    log_message(f"配置项 ID: {successful_config.id} 在流传输过程中失败: {repr(e)}")
+                                    add_attempt_log_event(
+                                        attempt_log_entry,
+                                        "stream_failed",
+                                        f"配置项 ID: {successful_config.id} 在流传输过程中失败: {repr(e)}",
+                                        status="failed",
+                                        status_label="流式失败",
+                                        title="流式传输失败",
+                                        finish=True,
+                                        error_type=error_type,
+                                        error_message=repr(e)
+                                    )
                                 raise
                             finally:
                                 await ctx.__aexit__(None, None, None)
 
-                        log_message(
-                            f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次流式请求启动成功 (HTTP {response.status_code}, 策略={mode_plan['mode_label']})")
+                        add_attempt_log_event(
+                            attempt_entry,
+                            "stream_started",
+                            f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次流式请求启动成功 (HTTP {response.status_code}, 策略={mode_plan['mode_label']})",
+                            status="streaming",
+                            status_label="流式传输中",
+                            title="流式请求已启动",
+                            http_status=response.status_code
+                        )
                         await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                         response_context_to_pass = response_context
                         response_context = None
                         return StreamingResponse(
-                            final_stream_generator(config, response_context_to_pass, response),
+                            final_stream_generator(config, response_context_to_pass, response, attempt_entry),
                             media_type="text/event-stream"
                         )
 
@@ -1937,15 +2679,19 @@ async def proxy_chat_completions(
                         image_saver=save_decoded_image_to_memory
                     )
                     total_tokens = extract_total_tokens(merged_json)
-                    if show_full_response_body:
-                        try:
-                            log_message(f"响应体完整内容: {json.dumps(merged_json, ensure_ascii=False)}")
-                        except Exception:
-                            log_message(f"响应体完整内容(序列化失败，使用字符串): {str(merged_json)}")
-                    if total_tokens is not None:
-                        log_message(f"配置项 ID: {config.id} 假非流成功 (total_tokens={total_tokens})")
-                    else:
-                        log_message(f"配置项 ID: {config.id} 假非流成功 (total_tokens=未知)")
+                    attach_attempt_response_body(attempt_entry, merged_json)
+                    total_tokens_text = total_tokens if total_tokens is not None else "未知"
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "success",
+                        f"配置项 ID: {config.id} 假非流成功 (total_tokens={total_tokens_text})",
+                        status="success",
+                        status_label="假非流成功",
+                        title="假非流请求成功",
+                        finish=True,
+                        http_status=response.status_code,
+                        total_tokens=total_tokens_text
+                    )
 
                     await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                     await response_context.__aexit__(None, None, None)
@@ -1963,11 +2709,7 @@ async def proxy_chat_completions(
                     image_public_url_prefix,
                     image_saver=save_decoded_image_to_memory
                 )
-                if show_full_response_body:
-                    try:
-                        log_message(f"响应体完整内容: {json.dumps(response_json, ensure_ascii=False)}")
-                    except Exception:
-                        log_message(f"响应体完整内容(序列化失败，使用字符串): {str(response_json)}")
+                attach_attempt_response_body(attempt_entry, response_json)
                 total_tokens = extract_total_tokens(response_json)
 
                 if downstream_is_stream:
@@ -2016,22 +2758,48 @@ async def proxy_chat_completions(
                         yield f"data: {json.dumps(done_payload, ensure_ascii=False)}\n\n".encode("utf-8")
                         yield b"data: [DONE]\n\n"
 
-                    if total_tokens is not None:
-                        log_message(f"配置项 ID: {config.id} 假流式成功 (total_tokens={total_tokens})")
-                    else:
-                        log_message(f"配置项 ID: {config.id} 假流式成功 (total_tokens=未知)")
+                    total_tokens_text = total_tokens if total_tokens is not None else "未知"
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "success",
+                        f"配置项 ID: {config.id} 假流式成功 (total_tokens={total_tokens_text})",
+                        status="success",
+                        status_label="假流式成功",
+                        title="假流式请求成功",
+                        finish=True,
+                        http_status=response.status_code,
+                        total_tokens=total_tokens_text
+                    )
                     await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                     return StreamingResponse(fake_stream_generator(response_json), media_type="text/event-stream")
 
-                if total_tokens is not None:
-                    log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次非流式请求成功 (total_tokens={total_tokens}, 策略={mode_plan['mode_label']})")
-                else:
-                    log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次非流式请求成功 (total_tokens=未知, 策略={mode_plan['mode_label']})")
+                total_tokens_text = total_tokens if total_tokens is not None else "未知"
+                add_attempt_log_event(
+                    attempt_entry,
+                    "success",
+                    f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次非流式请求成功 (total_tokens={total_tokens_text}, 策略={mode_plan['mode_label']})",
+                    status="success",
+                    status_label="非流式成功",
+                    title="非流式请求成功",
+                    finish=True,
+                    http_status=response.status_code,
+                    total_tokens=total_tokens_text
+                )
                 await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                 return JSONResponse(content=response_json, status_code=response.status_code)
 
             except ClientRequestAborted as e:
-                log_message(f"上游客户端已断开，停止当前代理请求: {e}")
+                add_attempt_log_event(
+                    attempt_entry,
+                    "cancelled",
+                    f"上游客户端已断开，停止当前代理请求: {e}",
+                    status="cancelled",
+                    status_label="客户端断开",
+                    title="请求被客户端断开",
+                    finish=True,
+                    error_type="ClientRequestAborted",
+                    error_message=str(e)
+                )
                 return Response(status_code=499)
             except asyncio.CancelledError:
                 log_message("当前代理请求已被取消，停止继续重试且不计入后端失败")
@@ -2058,7 +2826,18 @@ async def proxy_chat_completions(
                         return json.dumps(self._content, ensure_ascii=False)
 
                 last_error_response = PresetErrorResponse(error_content, 400)
-                log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (Images Generations 预设错误): {e}")
+                add_attempt_log_event(
+                    attempt_entry,
+                    "failed",
+                    f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次失败 (Images Generations 预设错误): {e}",
+                    status="failed",
+                    status_label="图片预设失败",
+                    title="Images 预设错误",
+                    finish=True,
+                    http_status=400,
+                    error_type="EndpointPresetError",
+                    error_message=str(e)
+                )
                 try:
                     await ensure_client_connected()
                 except ClientRequestAborted as disconnect_error:
@@ -2071,16 +2850,34 @@ async def proxy_chat_completions(
                     except ClientRequestAborted as disconnect_error:
                         log_message(f"上游客户端已断开，取消后续重试: {disconnect_error}")
                         return Response(status_code=499)
-                    log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "retry_next",
+                        f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试",
+                        status="retried",
+                        status_label="已进入重试",
+                        title="本次失败，准备重试",
+                        finish=True,
+                        next_attempt=attempt_no + 2
+                    )
                     continue
                 break
             except httpx.HTTPStatusError as e:
                 last_error, last_error_response = e, e.response
                 safe_error_text = sanitize_log_text(e.response.text)
-                log_message(
-                    f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (HTTP {e.response.status_code}): {safe_error_text}")
-                if show_full_response_body:
-                    log_message(f"响应体完整内容: {safe_error_text}")
+                add_attempt_log_event(
+                    attempt_entry,
+                    "failed",
+                    f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次失败 (HTTP {e.response.status_code}): {safe_error_text}",
+                    status="failed",
+                    status_label="HTTP 失败",
+                    title="上游 HTTP 错误",
+                    finish=True,
+                    http_status=e.response.status_code,
+                    error_type="HTTPStatusError",
+                    error_message=safe_error_text
+                )
+                attach_attempt_response_body(attempt_entry, safe_error_text, safe_error_text)
                 try:
                     await ensure_client_connected()
                 except ClientRequestAborted as disconnect_error:
@@ -2093,48 +2890,145 @@ async def proxy_chat_completions(
                     except ClientRequestAborted as disconnect_error:
                         log_message(f"上游客户端已断开，取消后续重试: {disconnect_error}")
                         return Response(status_code=499)
-                    log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "retry_next",
+                        f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试",
+                        status="retried",
+                        status_label="已进入重试",
+                        title="本次失败，准备重试",
+                        finish=True,
+                        next_attempt=attempt_no + 2
+                    )
                     continue
                 break
             except httpx.RequestError as e:
                 last_error = e
-                log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (RequestError): {e}")
+                add_attempt_log_event(
+                    attempt_entry,
+                    "failed",
+                    f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次失败 (RequestError): {e}",
+                    status="failed",
+                    status_label="请求错误",
+                    title="上游请求错误",
+                    finish=True,
+                    error_type="RequestError",
+                    error_message=str(e)
+                )
                 try:
                     await ensure_client_connected()
                 except ClientRequestAborted as disconnect_error:
-                    log_message(f"上游客户端已断开，本次下游失败不计入统计且停止重试: {disconnect_error}")
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "cancelled",
+                        f"上游客户端已断开，本次下游失败不计入统计且停止重试: {disconnect_error}",
+                        status="cancelled",
+                        status_label="客户端断开",
+                        title="请求被客户端断开",
+                        finish=True,
+                        error_type="ClientRequestAborted",
+                        error_message=str(disconnect_error)
+                    )
                     return Response(status_code=499)
                 await update_stats_and_state(config, False, scheme_name, [], 0)
                 if attempt_no < max_retries:
                     try:
                         await ensure_client_connected()
                     except ClientRequestAborted as disconnect_error:
-                        log_message(f"上游客户端已断开，取消后续重试: {disconnect_error}")
+                        add_attempt_log_event(
+                            attempt_entry,
+                            "cancelled",
+                            f"上游客户端已断开，取消后续重试: {disconnect_error}",
+                            status="cancelled",
+                            status_label="客户端断开",
+                            title="重试被客户端断开取消",
+                            finish=True,
+                            error_type="ClientRequestAborted",
+                            error_message=str(disconnect_error)
+                        )
                         return Response(status_code=499)
-                    log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "retry_next",
+                        f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试",
+                        status="retried",
+                        status_label="已进入重试",
+                        title="本次失败，准备重试",
+                        finish=True,
+                        next_attempt=attempt_no + 2
+                    )
                     continue
                 break
             except Exception as e:
                 error_type = type(e).__name__
                 if "ClientDisconnect" in error_type or "CancelledError" in error_type:
-                    log_message(f"检测到上游客户端已断开/请求被取消，停止继续重试 (Type: {error_type})")
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "cancelled",
+                        f"检测到上游客户端已断开/请求被取消，停止继续重试 (Type: {error_type})",
+                        status="cancelled",
+                        status_label="客户端断开",
+                        title="请求被客户端断开或取消",
+                        finish=True,
+                        error_type=error_type,
+                        error_message=str(e)
+                    )
                     return Response(status_code=499)
 
                 last_error = e
-                log_message(f"配置项 ID: {config.id} 第 {attempt_no + 1}/{max_retries + 1} 次失败 (Exception): {e}")
+                add_attempt_log_event(
+                    attempt_entry,
+                    "failed",
+                    f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次失败 (Exception): {e}",
+                    status="failed",
+                    status_label="异常失败",
+                    title="上游请求异常",
+                    finish=True,
+                    error_type=error_type,
+                    error_message=str(e)
+                )
                 try:
                     await ensure_client_connected()
                 except ClientRequestAborted as disconnect_error:
-                    log_message(f"上游客户端已断开，本次下游失败不计入统计且停止重试: {disconnect_error}")
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "cancelled",
+                        f"上游客户端已断开，本次下游失败不计入统计且停止重试: {disconnect_error}",
+                        status="cancelled",
+                        status_label="客户端断开",
+                        title="请求被客户端断开",
+                        finish=True,
+                        error_type="ClientRequestAborted",
+                        error_message=str(disconnect_error)
+                    )
                     return Response(status_code=499)
                 await update_stats_and_state(config, False, scheme_name, [], 0)
                 if attempt_no < max_retries:
                     try:
                         await ensure_client_connected()
                     except ClientRequestAborted as disconnect_error:
-                        log_message(f"上游客户端已断开，取消后续重试: {disconnect_error}")
+                        add_attempt_log_event(
+                            attempt_entry,
+                            "cancelled",
+                            f"上游客户端已断开，取消后续重试: {disconnect_error}",
+                            status="cancelled",
+                            status_label="客户端断开",
+                            title="重试被客户端断开取消",
+                            finish=True,
+                            error_type="ClientRequestAborted",
+                            error_message=str(disconnect_error)
+                        )
                         return Response(status_code=499)
-                    log_message(f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试")
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "retry_next",
+                        f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次重试",
+                        status="retried",
+                        status_label="已进入重试",
+                        title="本次失败，准备重试",
+                        finish=True,
+                        next_attempt=attempt_no + 2
+                    )
                     continue
                 break
             finally:
@@ -2154,17 +3048,394 @@ async def proxy_chat_completions(
     return JSONResponse(status_code=500, content={"error": f"所有后端均失败。最后错误: {str(last_error)}"})
 
 
+async def proxy_anthropic_messages_native_upstream(request: Request, anthropic_body: Dict[str, Any]) -> Optional[Response]:
+    """Anthropic 入站 -> Anthropic 原生上游，最小改写 body 以保护 prompt cache 命中。"""
+    requested_stream = bool(anthropic_body.get("stream", False))
+    requested_model = anthropic_body.get("model")
+
+    all_schemes = await get_all_schemes()
+    if not all_schemes:
+        return None
+
+    target_scheme_configs = all_schemes.get(requested_model)
+    scheme_name = requested_model
+    if not target_scheme_configs:
+        sorted_scheme_names = sorted(list(all_schemes.keys()))
+        if not sorted_scheme_names:
+            return None
+        scheme_name = sorted_scheme_names[0]
+        target_scheme_configs = all_schemes[scheme_name]
+
+    stats = await get_stats()
+    now_time = beijing_now()
+    active_configs: List[ApiConfig] = []
+    for config in target_scheme_configs:
+        if config.endpoint_preset != "anthropic_messages":
+            continue
+        config_stats = stats.get("by_config_id", {}).get(config.id, {})
+        disabled_until_str = config_stats.get("disabled_until")
+        if disabled_until_str:
+            disabled_until_time = parse_stats_datetime(disabled_until_str)
+            if disabled_until_time and now_time < disabled_until_time:
+                log_message(f"配置项 ID: {config.id} 当前被熔断禁用，跳过 Anthropic 原生上游。")
+                continue
+        active_configs.append(config)
+
+    if not active_configs:
+        return None
+
+    priority_groups = {k: list(g) for k, g in groupby(active_configs, key=lambda c: c.priority)}
+    round_robin_state_for_scheme = stats.get("round_robin_state", {}).get(scheme_name, {})
+    attempt_queue: List[ApiConfig] = []
+    for priority in sorted(priority_groups.keys()):
+        group = priority_groups[priority]
+        next_index = round_robin_state_for_scheme.get(str(priority), 0)
+        if next_index >= len(group):
+            next_index = 0
+        attempt_queue.extend(group[next_index:] + group[:next_index])
+
+    parent_request_id = f"req-{uuid.uuid4().hex[:12]}"
+    last_error = None
+    last_error_response = None
+
+    def build_native_body(config: ApiConfig, upstream_is_stream: bool) -> Dict[str, Any]:
+        proxy_body = copy.deepcopy(anthropic_body)
+        injected_message_groups = split_injected_messages_by_position(config.injected_messages, config.injection_position)
+        prepend_fragments = [openai_injected_message_to_anthropic_fragment(m) for m in injected_message_groups["prepend"]]
+        append_fragments = [openai_injected_message_to_anthropic_fragment(m) for m in injected_message_groups["append"]]
+        prepend_fragments = [m for m in prepend_fragments if isinstance(m, dict)]
+        append_fragments = [m for m in append_fragments if isinstance(m, dict)]
+
+        if prepend_fragments or append_fragments:
+            messages = proxy_body.get("messages") if isinstance(proxy_body.get("messages"), list) else []
+            prepend_messages = [m for m in prepend_fragments if m.get("role") != "system"]
+            append_messages = [m for m in append_fragments if m.get("role") != "system"]
+            if prepend_messages or append_messages:
+                proxy_body["messages"] = prepend_messages + messages + append_messages
+
+            system_texts = [m.get("content") for m in prepend_fragments + append_fragments if m.get("role") == "system" and isinstance(m.get("content"), str)]
+            if system_texts:
+                original_system = proxy_body.get("system")
+                injected_system_text = "\n".join(system_texts)
+                if isinstance(original_system, str) and original_system:
+                    proxy_body["system"] = f"{injected_system_text}\n{original_system}"
+                elif original_system is None:
+                    proxy_body["system"] = injected_system_text
+                else:
+                    proxy_body["system"] = original_system
+
+        proxy_body["stream"] = upstream_is_stream
+        return proxy_body
+
+    def anthropic_headers_for(config: ApiConfig, upstream_api_key: str, upstream_is_stream: bool) -> Dict[str, str]:
+        headers = {
+            "x-api-key": upstream_api_key,
+            "anthropic-version": request.headers.get("anthropic-version") or "2023-06-01",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if upstream_is_stream else "application/json"
+        }
+        anthropic_beta = request.headers.get("anthropic-beta")
+        if anthropic_beta:
+            headers["anthropic-beta"] = anthropic_beta
+        apply_user_agent_header(headers, config.user_agent_mode, config.custom_user_agent, request.headers.get("user-agent"))
+        return headers
+
+    for config in attempt_queue:
+        max_retries = config.max_retries if config.max_retries is not None else 0
+        if max_retries < 0:
+            max_retries = 0
+        original_group = priority_groups.get(config.priority, [])
+        try:
+            success_index_in_group = original_group.index(config)
+        except ValueError:
+            success_index_in_group = 0
+
+        upstream_base_url = config.url.strip()
+        upstream_api_key = config.api_key.strip()
+        mode_plan = resolve_stream_modes(requested_stream, config.stream_mode_strategy)
+        upstream_is_stream = mode_plan["upstream_is_stream"]
+        downstream_is_stream = mode_plan["downstream_is_stream"]
+        attempt_mode = "anthropic_native_stream" if upstream_is_stream and downstream_is_stream else (
+            "anthropic_native_fake_non_stream" if upstream_is_stream else (
+                "anthropic_native_fake_stream" if downstream_is_stream else "anthropic_native_non_stream"
+            )
+        )
+
+        for attempt_no in range(max_retries + 1):
+            response_context = None
+            attempt_entry = None
+            current_attempt = attempt_no + 1
+            attempt_total = max_retries + 1
+            try:
+                proxy_body = build_native_body(config, upstream_is_stream)
+                anthropic_path, proxy_body = build_anthropic_request_plan(proxy_body, config, source_protocol="anthropic")
+                anthropic_proxy_url = f"{upstream_base_url.rstrip('/')}{anthropic_path}"
+                headers = anthropic_headers_for(config, upstream_api_key, upstream_is_stream)
+                attempt_entry = create_upstream_attempt_log(
+                    parent_request_id,
+                    scheme_name,
+                    config,
+                    current_attempt,
+                    attempt_total,
+                    attempt_mode,
+                    "anthropic_messages",
+                    mode_plan["mode_label"],
+                    anthropic_proxy_url
+                )
+                add_attempt_log_event(
+                    attempt_entry,
+                    "send",
+                    f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic 原生上游请求已发送 (mode={attempt_mode}, 策略={mode_plan['mode_label']})",
+                    status="pending",
+                    status_label="已发送"
+                )
+
+                if upstream_is_stream:
+                    response_context = httpx_client.stream("POST", anthropic_proxy_url, headers=headers, json=proxy_body)
+                    response = await response_context.__aenter__()
+                    if response.status_code >= 400:
+                        response_body = await response.aread()
+                        error_text = response_body.decode("utf-8", errors="ignore")
+                        safe_error_text = sanitize_log_text(error_text)
+                        last_error = f"HTTP {response.status_code}: {safe_error_text}"
+                        last_error_response = JSONResponse(status_code=response.status_code, content=anthropic_error(safe_error_text))
+                        attach_attempt_response_body(attempt_entry, safe_error_text, safe_error_text)
+                        add_attempt_log_event(
+                            attempt_entry,
+                            "failed",
+                            f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic 原生流式上游失败 (HTTP {response.status_code}): {safe_error_text}",
+                            status="failed",
+                            status_label="HTTP 失败",
+                            title="Anthropic 原生流式上游返回错误",
+                            finish=True,
+                            http_status=response.status_code,
+                            error_type="HTTPStatusError",
+                            error_message=safe_error_text
+                        )
+                        await update_stats_and_state(config, False, scheme_name, [], 0)
+                        await response_context.__aexit__(None, None, None)
+                        response_context = None
+                        if attempt_no < max_retries:
+                            continue
+                        break
+
+                    if downstream_is_stream:
+                        async def native_stream_generator(successful_config, ctx, resp, attempt_log_entry, request_body_for_log):
+                            pending = bytearray()
+                            stream_events: List[Dict[str, Any]] = []
+                            total_tokens = None
+                            cached_tokens = None
+
+                            def consume_line(line_text: str):
+                                nonlocal total_tokens, cached_tokens
+                                line_text = line_text.strip()
+                                if not line_text.startswith("data:"):
+                                    return
+                                payload = line_text[5:].strip()
+                                if not payload or payload == "[DONE]":
+                                    return
+                                try:
+                                    data_obj = json.loads(payload)
+                                except Exception:
+                                    return
+                                if isinstance(data_obj, dict):
+                                    stream_events.append(data_obj)
+                                    extracted_total = extract_total_tokens(data_obj)
+                                    if extracted_total is not None:
+                                        total_tokens = extracted_total
+                                    extracted_cached = extract_cached_tokens(data_obj)
+                                    if extracted_cached is not None:
+                                        cached_tokens = extracted_cached
+
+                            def attach_native_stream_body():
+                                if not stream_events:
+                                    return
+                                try:
+                                    merged_payload = convert_anthropic_stream_events_to_response(stream_events, request_body_for_log)
+                                    attach_attempt_response_body(attempt_log_entry, merged_payload)
+                                except Exception as merge_error:
+                                    add_attempt_log_event(
+                                        attempt_log_entry,
+                                        "stream_response_body_skipped",
+                                        f"Anthropic 原生流式响应聚合失败: {repr(merge_error)}",
+                                        status=attempt_log_entry.get("status"),
+                                        status_label=attempt_log_entry.get("status_label")
+                                    )
+
+                            try:
+                                async for chunk in resp.aiter_bytes():
+                                    yield chunk
+                                    pending.extend(chunk)
+                                    while b"\n" in pending:
+                                        line_bytes, _, rest = pending.partition(b"\n")
+                                        pending = bytearray(rest)
+                                        consume_line(line_bytes.decode("utf-8", errors="ignore"))
+                                if pending:
+                                    consume_line(pending.decode("utf-8", errors="ignore"))
+                                attach_native_stream_body()
+                                total_tokens_text = total_tokens if total_tokens is not None else "未知"
+                                cached_tokens_text = cached_tokens if cached_tokens is not None else "未知"
+                                add_attempt_log_event(
+                                    attempt_log_entry,
+                                    "stream_finished",
+                                    f"配置项 ID: {successful_config.id} Anthropic 原生流式请求结束 (total_tokens={total_tokens_text}, cached_tokens={cached_tokens_text})",
+                                    status="success",
+                                    status_label="流式完成",
+                                    title="Anthropic 原生流式请求完成",
+                                    finish=True,
+                                    total_tokens=total_tokens_text,
+                                    cached_tokens=cached_tokens_text
+                                )
+                            except Exception as e:
+                                error_type = type(e).__name__
+                                attach_native_stream_body()
+                                add_attempt_log_event(
+                                    attempt_log_entry,
+                                    "stream_failed",
+                                    f"配置项 ID: {successful_config.id} Anthropic 原生流传输结束: {repr(e)}",
+                                    status="cancelled" if "ClientDisconnect" in error_type or "CancelledError" in error_type else "failed",
+                                    status_label="客户端断开" if "ClientDisconnect" in error_type or "CancelledError" in error_type else "流式失败",
+                                    title="Anthropic 原生流式传输结束",
+                                    finish=True,
+                                    error_type=error_type,
+                                    error_message=repr(e)
+                                )
+                                if "ClientDisconnect" not in error_type and "CancelledError" not in error_type:
+                                    raise
+                            finally:
+                                await ctx.__aexit__(None, None, None)
+
+                        add_attempt_log_event(
+                            attempt_entry,
+                            "stream_started",
+                            f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic 原生流式请求启动成功 (HTTP {response.status_code})",
+                            status="streaming",
+                            status_label="流式传输中",
+                            title="Anthropic 原生流式请求已启动",
+                            http_status=response.status_code
+                        )
+                        await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                        response_context_to_pass = response_context
+                        response_context = None
+                        return StreamingResponse(native_stream_generator(config, response_context_to_pass, response, attempt_entry, proxy_body), media_type="text/event-stream")
+
+                    stream_bytes = await response.aread()
+                    anthropic_payload = convert_anthropic_sse_bytes_to_non_stream_json(stream_bytes, proxy_body)
+                    attach_attempt_response_body(attempt_entry, anthropic_payload)
+                    total_tokens = extract_total_tokens(anthropic_payload)
+                    cached_tokens = extract_cached_tokens(anthropic_payload)
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "success",
+                        f"配置项 ID: {config.id} Anthropic 原生假非流成功 (total_tokens={total_tokens if total_tokens is not None else '未知'}, cached_tokens={cached_tokens if cached_tokens is not None else '未知'})",
+                        status="success",
+                        status_label="假非流成功",
+                        title="Anthropic 原生假非流请求成功",
+                        finish=True,
+                        http_status=response.status_code,
+                        total_tokens=total_tokens if total_tokens is not None else "未知",
+                        cached_tokens=cached_tokens if cached_tokens is not None else "未知"
+                    )
+                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                    await response_context.__aexit__(None, None, None)
+                    response_context = None
+                    return JSONResponse(status_code=response.status_code, content=anthropic_payload)
+
+                response = await httpx_client.post(anthropic_proxy_url, headers=headers, json=proxy_body)
+                response.raise_for_status()
+                anthropic_payload = response.json()
+                attach_attempt_response_body(attempt_entry, anthropic_payload)
+                total_tokens = extract_total_tokens(anthropic_payload)
+                cached_tokens = extract_cached_tokens(anthropic_payload)
+
+                if downstream_is_stream:
+                    openai_payload_for_stream = anthropic_response_to_openai_chat(anthropic_payload, proxy_body)
+
+                    async def native_fake_stream_generator(final_payload: Dict[str, Any], original_body: Dict[str, Any]):
+                        for event_bytes in openai_json_to_anthropic_stream(final_payload, original_body):
+                            yield event_bytes
+
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "success",
+                        f"配置项 ID: {config.id} Anthropic 原生假流式成功 (total_tokens={total_tokens if total_tokens is not None else '未知'}, cached_tokens={cached_tokens if cached_tokens is not None else '未知'})",
+                        status="success",
+                        status_label="假流式成功",
+                        title="Anthropic 原生假流式请求成功",
+                        finish=True,
+                        http_status=response.status_code,
+                        total_tokens=total_tokens if total_tokens is not None else "未知",
+                        cached_tokens=cached_tokens if cached_tokens is not None else "未知"
+                    )
+                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                    return StreamingResponse(native_fake_stream_generator(openai_payload_for_stream, proxy_body), media_type="text/event-stream")
+
+                add_attempt_log_event(
+                    attempt_entry,
+                    "success",
+                    f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic 原生非流式请求成功 (total_tokens={total_tokens if total_tokens is not None else '未知'}, cached_tokens={cached_tokens if cached_tokens is not None else '未知'})",
+                    status="success",
+                    status_label="非流式成功",
+                    title="Anthropic 原生非流式请求成功",
+                    finish=True,
+                    http_status=response.status_code,
+                    total_tokens=total_tokens if total_tokens is not None else "未知",
+                    cached_tokens=cached_tokens if cached_tokens is not None else "未知"
+                )
+                await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                return JSONResponse(status_code=response.status_code, content=anthropic_payload)
+
+            except EndpointPresetError as e:
+                last_error = e
+                last_error_response = JSONResponse(status_code=400, content=anthropic_error(str(e)))
+                add_attempt_log_event(attempt_entry, "failed", f"Anthropic 原生预设错误: {e}", status="failed", status_label="预设失败", title="Anthropic 原生预设错误", finish=True, http_status=400, error_type="EndpointPresetError", error_message=str(e))
+                await update_stats_and_state(config, False, scheme_name, [], 0)
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                safe_error_text = sanitize_log_text(e.response.text)
+                last_error_response = JSONResponse(status_code=e.response.status_code, content=anthropic_error(safe_error_text))
+                attach_attempt_response_body(attempt_entry, safe_error_text, safe_error_text)
+                add_attempt_log_event(attempt_entry, "failed", f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic 原生请求失败 (HTTP {e.response.status_code}): {safe_error_text}", status="failed", status_label="HTTP 失败", title="Anthropic 原生上游 HTTP 错误", finish=True, http_status=e.response.status_code, error_type="HTTPStatusError", error_message=safe_error_text)
+                await update_stats_and_state(config, False, scheme_name, [], 0)
+            except httpx.RequestError as e:
+                last_error = e
+                add_attempt_log_event(attempt_entry, "failed", f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic 原生请求失败 (RequestError): {e}", status="failed", status_label="请求错误", title="Anthropic 原生上游请求错误", finish=True, error_type="RequestError", error_message=str(e))
+                await update_stats_and_state(config, False, scheme_name, [], 0)
+            except Exception as e:
+                error_type = type(e).__name__
+                last_error = e
+                add_attempt_log_event(attempt_entry, "failed", f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic 原生请求异常: {e}", status="failed", status_label="异常失败", title="Anthropic 原生上游异常", finish=True, error_type=error_type, error_message=str(e))
+                await update_stats_and_state(config, False, scheme_name, [], 0)
+            finally:
+                if response_context is not None:
+                    await response_context.__aexit__(None, None, None)
+
+            if attempt_no < max_retries:
+                add_attempt_log_event(attempt_entry, "retry_next", f"配置项 ID: {config.id} 即将进行第 {attempt_no + 2} 次 Anthropic 原生重试", status="retried", status_label="已进入重试", title="本次失败，准备重试", finish=True, next_attempt=attempt_no + 2)
+                continue
+            break
+
+    log_message("所有 Anthropic 原生上游配置项均尝试失败")
+    if last_error_response is not None:
+        return last_error_response
+    return JSONResponse(status_code=500, content=anthropic_error(f"所有 Anthropic 原生上游均失败。最后错误: {str(last_error)}", "api_error"))
+
+
 @app.post("/v1/messages", tags=["Proxy"])
 async def proxy_anthropic_messages(
         request: Request,
         auth: bool = Depends(verify_anthropic_key)
 ):
-    """Anthropic Messages 兼容入口。内部转换为 OpenAI chat.completions 请求并复用现有聚合代理逻辑。"""
+    """Anthropic Messages 兼容入口。优先原生路由 Anthropic 上游；否则转换为 OpenAI 主流程。"""
     try:
         anthropic_body = await request.json()
     except Exception:
         log_message("Anthropic 请求体 JSON 解析失败")
         return JSONResponse(status_code=400, content=anthropic_error("无效的 JSON 请求体"))
+
+    native_response = await proxy_anthropic_messages_native_upstream(request, anthropic_body)
+    if native_response is not None:
+        return native_response
 
     try:
         openai_body = anthropic_to_openai_chat_request(anthropic_body)
@@ -2392,9 +3663,15 @@ async def unblock_ip(ip: str):
 
 
 @admin_router.get("/logs")
-async def get_logs() -> List[str]:
-    """获取最新的 200 条内存日志"""
-    return list(log_deque)
+async def get_logs() -> Dict[str, Any]:
+    """获取最新的结构化实时日志；raw_logs 保留旧文本日志作为兼容兜底。"""
+    with structured_log_lock:
+        entries = [_serialize_structured_log_entry(entry) for entry in structured_log_deque]
+    return {
+        "version": 2,
+        "entries": entries,
+        "raw_logs": list(log_deque)
+    }
 
 
 @admin_router.post("/models/query")
@@ -2443,17 +3720,14 @@ async def query_upstream_models(query: UpstreamModelQueryRequest, request: Reque
 
 @admin_router.get("/settings/logs")
 async def get_log_settings() -> Dict[str, bool]:
-    """获取日志展示设置"""
-    return {"show_full_response_body": show_full_response_body}
+    """兼容旧前端：响应体日志现在默认始终记录。"""
+    return {"show_full_response_body": True}
 
 
 @admin_router.put("/settings/logs")
-async def update_log_settings(settings: LogSettingsUpdate) -> Dict[str, bool]:
-    """更新日志展示设置"""
-    global show_full_response_body
-    show_full_response_body = settings.show_full_response_body
-    log_message(f"管理: 已{'开启' if show_full_response_body else '关闭'}完整响应体日志")
-    return {"show_full_response_body": show_full_response_body}
+async def update_log_settings(settings: Dict[str, Any]) -> Dict[str, bool]:
+    """兼容旧前端：忽略开关写入，响应体日志现在默认始终记录。"""
+    return {"show_full_response_body": True}
 
 
 app.include_router(admin_router)

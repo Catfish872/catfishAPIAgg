@@ -1,4 +1,5 @@
 import base64
+import copy
 import os
 import re
 import time
@@ -385,6 +386,39 @@ def convert_response_base64_images_to_urls(
         return replace_inline_base64_images_with_urls(payload, image_output_dir, image_public_url_prefix, image_saver=image_saver)
 
     return payload
+
+
+def build_anthropic_request_plan(raw_body: Dict[str, Any], config: Any, *, source_protocol: str = "openai") -> Tuple[str, Dict[str, Any]]:
+    """构造 Anthropic /v1/messages 上游请求计划，返回 (path, payload)。
+
+    - source_protocol="openai": raw_body 是 OpenAI Chat Completions 结构，由调用方先转换为 Anthropic 结构后传入也可；
+      本函数只负责预设层通用字段覆盖与必填补齐。
+    - source_protocol="anthropic": raw_body 是 Anthropic Messages 结构。为保证 prompt cache 命中，除 model/request_overrides/stream/max_tokens
+      等必要字段外，必须最小改写，不能重排 messages/system/tools/cache_control。
+    """
+    if not isinstance(raw_body, dict):
+        raise EndpointPresetError("anthropic_messages preset 请求体必须是 JSON 对象")
+
+    payload = copy.deepcopy(raw_body)
+    model = _config_get(config, "model") or payload.get("model")
+    if is_empty_text(model):
+        raise EndpointPresetError("anthropic_messages preset 缺少 model")
+    payload["model"] = str(model).strip()
+
+    if payload.get("max_tokens") is None:
+        payload["max_tokens"] = 32768
+
+    request_overrides = _config_get(config, "request_overrides", {})
+    if isinstance(request_overrides, dict) and request_overrides:
+        payload.update(copy.deepcopy(request_overrides))
+        if payload.get("max_tokens") is None:
+            payload["max_tokens"] = 32768
+
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise EndpointPresetError("anthropic_messages preset 缺少 messages 数组")
+
+    return "/messages", payload
 
 
 def wrap_image_response_as_chat_completion(

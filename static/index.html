@@ -194,10 +194,12 @@
                                 <select id="config-endpoint-preset">
                                     <option value="chat_completions">Chat Completions (/chat/completions)</option>
                                     <option value="images_generations">Images Generations (/images/generations)</option>
+                                    <option value="anthropic_messages">Anthropic Messages (/messages)</option>
                                 </select>
                                 <small>
                                     Chat Completions：默认聊天端点，保持原行为。<br>
-                                    Images Generations：将 chat messages 自动合成为 prompt，并按下方“图像上游模式”选择实际图片端点和参考图字段；若上游返回 HTTP 202 + task_id，会自动轮询最终图片结果。
+                                    Images Generations：将 chat messages 自动合成为 prompt，并按下方“图像上游模式”选择实际图片端点和参考图字段；若上游返回 HTTP 202 + task_id，会自动轮询最终图片结果。<br>
+                                    Anthropic Messages：将上游请求发送到 Anthropic 原生 /messages；OpenAI 入站会自动转换，Anthropic 入站会尽量原生透传以保留 prompt cache。
                                 </small>
                             </div>
                             <div id="image-options-group" class="input-group full-span image-options-group">
@@ -427,15 +429,24 @@
             <!-- 3. 实时日志 -->
             <section id="logs-tab" class="tab-content card">
                 <h2>实时日志 (最新 200 条)</h2>
-                <div class="log-settings-row">
-                    <label>
-                        <input type="checkbox" id="toggle-full-request-log">
-                        显示完整响应体日志
-                    </label>
-                    <small id="full-request-log-status"></small>
-                </div>
                 <div class="logs-container">
-                    <pre id="logs-content">加载中...</pre>
+                    <div id="logs-content" class="logs-list" aria-live="polite">
+                        <div class="logs-empty-state">加载中...</div>
+                    </div>
+                </div>
+                <div id="log-detail-modal" class="log-detail-modal hidden" role="dialog" aria-modal="true" aria-labelledby="log-detail-title">
+                    <div class="log-detail-backdrop" data-log-detail-close></div>
+                    <div class="log-detail-panel card">
+                        <div class="log-detail-header">
+                            <div>
+                                <p class="log-detail-kicker">上游请求详情</p>
+                                <h3 id="log-detail-title">日志详情</h3>
+                                <small id="log-detail-subtitle"></small>
+                            </div>
+                            <button type="button" class="button log-detail-close" data-log-detail-close>关闭</button>
+                        </div>
+                        <div id="log-detail-body" class="log-detail-body"></div>
+                    </div>
                 </div>
             </section>
         </main>
