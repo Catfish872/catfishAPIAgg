@@ -80,6 +80,9 @@ document.addEventListener("DOMContentLoaded", () => {
     let allSchemesCache = {}; // 缓存配置数据，用于统计显示
     let configStatsCache = { total: {}, today: {} };
     let latestLogEntries = [];
+    let latestLogSeq = 0;
+    let isLoadingLogs = false;
+    const LOG_REQUEST_TIMEOUT_MS = 8000;
 
     const CONFIG_COLLAPSE_STORAGE_KEY = "catfish_config_scheme_collapsed";
     const STATS_COLLAPSE_STORAGE_KEY = "catfish_stats_sections_open";
@@ -878,7 +881,7 @@ document.addEventListener("DOMContentLoaded", () => {
             <span class="log-pill"><b>${escapeHtml(label)}</b>${escapeHtml(value)}</span>
         `).join("");
         return `
-            <article class="log-entry log-entry-${escapeHtml(statusMeta.className)} ${entry.kind === "system" ? "log-entry-system" : ""}">
+            <article class="log-entry log-entry-${escapeHtml(statusMeta.className)} ${entry.kind === "system" ? "log-entry-system" : ""}" data-log-entry-id="${escapeAttr(entry.id || "")}">
                 <div class="log-entry-main">
                     <div class="log-entry-topline">
                         <span class="log-kind-chip">${escapeHtml(kindLabel)}</span>
@@ -894,14 +897,83 @@ document.addEventListener("DOMContentLoaded", () => {
         `;
     }
 
-    function renderLogs(entries) {
+    function sortLogEntriesForDisplay(entries) {
+        return [...entries].sort((a, b) => {
+            const seqDiff = Number(b.seq || 0) - Number(a.seq || 0);
+            if (seqDiff) return seqDiff;
+            return new Date(b.updated_at || b.finished_at || b.started_at || 0) - new Date(a.updated_at || a.finished_at || a.started_at || 0);
+        });
+    }
+
+    function createLogEntryElement(entry) {
+        const template = document.createElement("template");
+        template.innerHTML = renderLogEntry(entry).trim();
+        return template.content.firstElementChild;
+    }
+
+    function renderLogListFromCache() {
         if (!logsContent) return;
-        latestLogEntries = [...entries].reverse();
         if (!latestLogEntries.length) {
             logsContent.innerHTML = `<div class="logs-empty-state">暂无日志。发起请求或执行管理操作后会显示在这里。</div>`;
             return;
         }
         logsContent.innerHTML = latestLogEntries.map(renderLogEntry).join("");
+    }
+
+    function patchLogListFromCache(changedIds = new Set()) {
+        if (!logsContent) return;
+        if (!latestLogEntries.length) {
+            renderLogListFromCache();
+            return;
+        }
+
+        const desiredIds = new Set(latestLogEntries.map(entry => String(entry.id)));
+        logsContent.querySelectorAll(".log-entry[data-log-entry-id]").forEach(node => {
+            if (!desiredIds.has(String(node.dataset.logEntryId))) node.remove();
+        });
+
+        let cursor = logsContent.firstElementChild;
+        latestLogEntries.forEach(entry => {
+            const id = String(entry.id);
+            let node = logsContent.querySelector(`.log-entry[data-log-entry-id="${CSS.escape(id)}"]`);
+            if (!node || changedIds.has(id)) {
+                const newNode = createLogEntryElement(entry);
+                if (node) {
+                    node.replaceWith(newNode);
+                    node = newNode;
+                } else {
+                    node = newNode;
+                }
+            }
+            if (node !== cursor) {
+                logsContent.insertBefore(node, cursor || null);
+            }
+            cursor = node.nextElementSibling;
+        });
+    }
+
+    function renderLogs(entries) {
+        latestLogEntries = sortLogEntriesForDisplay(entries).slice(0, 200);
+        renderLogListFromCache();
+    }
+
+    function applyLogPayload(payload) {
+        const entries = normalizeLogPayload(payload);
+        const mode = payload?.mode || "snapshot";
+        const payloadSeq = Number(payload?.seq || 0);
+        if (payloadSeq > latestLogSeq) latestLogSeq = payloadSeq;
+
+        if (mode === "delta" && latestLogEntries.length) {
+            if (!entries.length) return;
+            const changedIds = new Set(entries.map(entry => String(entry.id)));
+            const byId = new Map(latestLogEntries.map(entry => [String(entry.id), entry]));
+            entries.forEach(entry => byId.set(String(entry.id), { ...(byId.get(String(entry.id)) || {}), ...entry }));
+            latestLogEntries = sortLogEntriesForDisplay(Array.from(byId.values())).slice(0, 200);
+            patchLogListFromCache(changedIds);
+            return;
+        }
+
+        renderLogs(entries);
     }
 
     function detailKeyValueRows(rows) {
@@ -974,9 +1046,21 @@ document.addEventListener("DOMContentLoaded", () => {
         `;
     }
 
-    function openLogDetail(entryId) {
-        const entry = latestLogEntries.find(item => String(item.id) === String(entryId));
+    async function openLogDetail(entryId) {
+        let entry = latestLogEntries.find(item => String(item.id) === String(entryId));
         if (!entry || !logDetailModal || !logDetailBody) return;
+        try {
+            const response = await authedFetch(`/admin/logs/${encodeURIComponent(entryId)}`);
+            if (response && response.ok) {
+                const payload = await response.json();
+                if (payload?.entry) {
+                    entry = payload.entry;
+                    latestLogEntries = latestLogEntries.map(item => String(item.id) === String(entryId) ? { ...item, ...entry } : item);
+                }
+            }
+        } catch (err) {
+            console.error("加载日志详情失败:", err);
+        }
         const statusMeta = getLogStatusMeta(entry);
         const title = entry.title || entry.status_label || (entry.kind === "attempt" ? "上游请求详情" : "系统事件详情");
         logDetailTitle.textContent = title;
@@ -1051,16 +1135,26 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     async function loadLogs() {
+        if (isLoadingLogs) return;
+        isLoadingLogs = true;
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), LOG_REQUEST_TIMEOUT_MS);
         try {
-            const response = await authedFetch("/admin/logs");
+            const query = latestLogSeq > 0 ? `?after_seq=${encodeURIComponent(latestLogSeq)}` : "";
+            const response = await authedFetch(`/admin/logs${query}`, { signal: controller.signal });
             if (!response || !response.ok) return;
             const payload = await response.json();
-            renderLogs(normalizeLogPayload(payload));
+            applyLogPayload(payload);
         } catch (err) {
-            console.error("加载日志失败:", err);
-            if (logsContent) {
-                logsContent.innerHTML = `<div class="logs-empty-state logs-empty-error">加载日志失败：${escapeHtml(err.message)}</div>`;
+            if (err.name !== "AbortError") {
+                console.error("加载日志失败:", err);
+                if (logsContent && !latestLogEntries.length) {
+                    logsContent.innerHTML = `<div class="logs-empty-state logs-empty-error">加载日志失败：${escapeHtml(err.message)}</div>`;
+                }
             }
+        } finally {
+            window.clearTimeout(timeoutId);
+            isLoadingLogs = false;
         }
     }
 

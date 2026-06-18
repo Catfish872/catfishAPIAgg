@@ -92,6 +92,7 @@ log_deque = collections.deque(maxlen=200)
 # 结构化实时日志：一条 attempt 代表一次真实向上游发出的请求；system 代表管理/认证/系统事件
 structured_log_deque = collections.deque(maxlen=200)
 structured_log_lock = RLock()
+structured_log_sequence = 0
 
 # 异步文件读写锁
 file_lock = asyncio.Lock()
@@ -299,16 +300,18 @@ def _append_structured_system_event(raw_line: str, message: str, timestamp_iso: 
         "_started_epoch": timestamp_epoch
     }
     with structured_log_lock:
+        _assign_structured_log_seq_unlocked(entry)
         structured_log_deque.append(entry)
 
 
-def log_message(message: str, emit_system_event: bool = True) -> str:
+def log_message(message: str, emit_system_event: bool = True, print_to_stdout: bool = True) -> str:
     """向内存日志队列中添加一条原始日志；必要时同步写入结构化系统事件。"""
     now_display, now_iso, now_epoch = _log_now_parts()
     safe_message = sanitize_log_text(message)
     raw_line = f"[{now_display}] {safe_message}"
     log_deque.append(raw_line)
-    print(safe_message)  # 同时也打印到控制台
+    if print_to_stdout:
+        print(safe_message)  # 同时也打印到控制台
     if emit_system_event:
         _append_structured_system_event(raw_line, safe_message, now_iso, now_epoch)
     return raw_line
@@ -358,8 +361,47 @@ def _extract_response_observations(payload: Any) -> Dict[str, Any]:
     return summary
 
 
+def _next_structured_log_seq_unlocked() -> int:
+    global structured_log_sequence
+    structured_log_sequence += 1
+    return structured_log_sequence
+
+
+def _assign_structured_log_seq_unlocked(entry: Dict[str, Any]) -> int:
+    seq = _next_structured_log_seq_unlocked()
+    entry["_seq"] = seq
+    entry["_updated_seq"] = seq
+    return seq
+
+
+def _touch_structured_log_entry_unlocked(entry: Dict[str, Any]) -> int:
+    updated_seq = _next_structured_log_seq_unlocked()
+    entry["_updated_seq"] = updated_seq
+    return updated_seq
+
+
 def _serialize_structured_log_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: copy.deepcopy(value) for key, value in entry.items() if not key.startswith("_")}
+    result = {key: copy.deepcopy(value) for key, value in entry.items() if not key.startswith("_")}
+    result["seq"] = entry.get("_seq", 0)
+    result["updated_seq"] = entry.get("_updated_seq", entry.get("_seq", 0))
+    return result
+
+
+def _serialize_log_list_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """列表轮询只返回当前列表可见字段，完整响应体/时间线/原始日志由详情接口按需返回。"""
+    fields = (
+        "kind", "id", "parent_request_id", "status", "status_label", "event_type", "title", "message",
+        "started_at", "updated_at", "finished_at", "duration_ms", "scheme_name", "config_id", "priority",
+        "max_retries", "attempt_current", "attempt_total", "mode", "endpoint_preset", "http_status", "strategy",
+        "upstream_url", "total_tokens", "cached_tokens", "prompt_tokens", "completion_tokens", "response_id",
+        "response_object", "response_model", "response_summary", "image_urls", "task_id", "poll_url",
+        "error_type", "error_message", "next_attempt"
+    )
+    result = {key: copy.deepcopy(entry.get(key)) for key in fields if key in entry}
+    result["seq"] = entry.get("_seq", 0)
+    result["updated_seq"] = entry.get("_updated_seq", entry.get("_seq", 0))
+    result["has_detail"] = True
+    return result
 
 
 def create_upstream_attempt_log(
@@ -419,6 +461,7 @@ def create_upstream_attempt_log(
         "_started_epoch": now_epoch
     }
     with structured_log_lock:
+        _assign_structured_log_seq_unlocked(entry)
         structured_log_deque.append(entry)
     add_attempt_log_event(
         entry,
@@ -440,11 +483,12 @@ def add_attempt_log_event(
         status_label: Optional[str] = None,
         title: Optional[str] = None,
         finish: bool = False,
+        print_to_stdout: bool = True,
         **fields: Any
 ) -> Optional[str]:
     if entry is None:
         return None
-    raw_line = log_message(message, emit_system_event=False)
+    raw_line = log_message(message, emit_system_event=False, print_to_stdout=print_to_stdout)
     _, now_iso, now_epoch = _log_now_parts()
     with structured_log_lock:
         entry["updated_at"] = now_iso
@@ -468,6 +512,7 @@ def add_attempt_log_event(
             "message": message,
             "raw": raw_line
         })
+        _touch_structured_log_entry_unlocked(entry)
     return raw_line
 
 
@@ -508,6 +553,7 @@ def attach_attempt_response_body(entry: Optional[Dict[str, Any]], payload: Any, 
         f"响应体完整内容: {body_text}",
         status=entry.get("status"),
         status_label=entry.get("status_label"),
+        print_to_stdout=False,
         **fields
     )
 
@@ -849,7 +895,7 @@ async def load_stats_from_disk() -> dict:
 async def write_stats_to_disk(stats: dict):
     async with file_lock:
         async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
-            await f.write(json.dumps(stats, indent=2, ensure_ascii=False))
+            await f.write(json.dumps(stats, ensure_ascii=False, separators=(",", ":")))
 
 
 async def flush_stats_if_needed(force: bool = False):
@@ -3663,15 +3709,47 @@ async def unblock_ip(ip: str):
 
 
 @admin_router.get("/logs")
-async def get_logs() -> Dict[str, Any]:
-    """获取最新的结构化实时日志；raw_logs 保留旧文本日志作为兼容兜底。"""
+async def get_logs(after_seq: int = 0) -> Dict[str, Any]:
+    """获取最新 200 条日志列表；after_seq 存在时只返回变化条目，前端合并后仍展示完整 200 条。"""
     with structured_log_lock:
-        entries = [_serialize_structured_log_entry(entry) for entry in structured_log_deque]
+        current_seq = structured_log_sequence
+        if after_seq > 0 and after_seq >= current_seq:
+            return {
+                "version": 3,
+                "mode": "delta",
+                "seq": current_seq,
+                "entries": [],
+                "raw_logs": []
+            }
+
+        entries_source = list(structured_log_deque)
+        if after_seq > 0:
+            entries_source = [entry for entry in entries_source if int(entry.get("_updated_seq") or 0) > after_seq]
+            mode = "delta"
+        else:
+            mode = "snapshot"
+        entries = [_serialize_log_list_entry(entry) for entry in entries_source]
+
     return {
-        "version": 2,
+        "version": 3,
+        "mode": mode,
+        "seq": current_seq,
         "entries": entries,
-        "raw_logs": list(log_deque)
+        "raw_logs": []
     }
+
+
+@admin_router.get("/logs/{entry_id}")
+async def get_log_detail(entry_id: str) -> Dict[str, Any]:
+    """按 ID 获取完整日志详情；字段保持与旧完整日志对象一致。"""
+    with structured_log_lock:
+        for entry in structured_log_deque:
+            if str(entry.get("id")) == str(entry_id):
+                return {
+                    "version": 3,
+                    "entry": _serialize_structured_log_entry(entry)
+                }
+    raise HTTPException(status_code=404, detail="日志条目不存在或已被最新 200 条窗口淘汰")
 
 
 @admin_router.post("/models/query")
