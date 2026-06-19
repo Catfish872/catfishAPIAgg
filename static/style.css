@@ -2193,11 +2193,72 @@ html[data-theme="deepseek"] .ambient-deepseek {
 
     .logs-container {
         height: 420px;
+        height: min(520px, 68dvh);
         padding: 3.2rem 0.75rem 0.75rem;
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior: contain;
     }
 
     .log-entry {
         grid-template-columns: 1fr;
+        gap: 0.85rem;
+        background: rgba(255, 255, 255, 0.94);
+        color: #111827;
+        border-color: rgba(255, 255, 255, 0.7);
+        box-shadow: 0 14px 30px rgba(0, 0, 0, 0.22);
+    }
+
+    html[data-theme="deepseek"] .log-entry {
+        background: rgba(8, 24, 42, 0.96);
+        color: #eefcff;
+        border-color: rgba(125, 211, 252, 0.28);
+    }
+
+    .log-entry-system {
+        background: rgba(255, 255, 255, 0.88);
+    }
+
+    html[data-theme="deepseek"] .log-entry-system {
+        background: rgba(12, 35, 56, 0.94);
+    }
+
+    .log-entry h3,
+    .log-pill b {
+        color: inherit;
+    }
+
+    .log-entry p,
+    .log-entry-topline time,
+    .log-pill {
+        color: rgba(31, 41, 55, 0.82);
+    }
+
+    html[data-theme="deepseek"] .log-entry p,
+    html[data-theme="deepseek"] .log-entry-topline time,
+    html[data-theme="deepseek"] .log-pill {
+        color: rgba(213, 245, 255, 0.82);
+    }
+
+    .log-kind-chip,
+    .log-pill {
+        background: rgba(255, 255, 255, 0.72);
+        border-color: rgba(17, 24, 39, 0.12);
+    }
+
+    html[data-theme="deepseek"] .log-kind-chip,
+    html[data-theme="deepseek"] .log-pill {
+        background: rgba(255, 255, 255, 0.08);
+        border-color: rgba(125, 211, 252, 0.22);
+    }
+
+    .log-status-badge {
+        color: #fff;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.22);
+    }
+
+    .log-status-warning {
+        color: #2b1a00;
+        text-shadow: none;
     }
 
     .log-detail-button {
@@ -2205,16 +2266,58 @@ html[data-theme="deepseek"] .ambient-deepseek {
     }
 
     .log-detail-modal {
-        align-items: flex-start;
-        padding: 0.65rem 0.65rem max(2.5rem, env(safe-area-inset-bottom));
+        align-items: stretch;
+        justify-content: stretch;
+        overflow: hidden;
+        padding: max(0.5rem, env(safe-area-inset-top)) 0.65rem max(0.75rem, env(safe-area-inset-bottom));
+        touch-action: pan-y;
     }
 
     .log-detail-panel {
-        max-height: calc(100dvh - max(2.5rem, env(safe-area-inset-bottom)) - 1.3rem);
+        width: 100%;
+        height: calc(100vh - max(0.5rem, env(safe-area-inset-top)) - max(0.75rem, env(safe-area-inset-bottom)));
+        height: calc(100dvh - max(0.5rem, env(safe-area-inset-top)) - max(0.75rem, env(safe-area-inset-bottom)));
+        max-height: none;
+        min-height: 0;
+        margin-bottom: 0;
+        padding: 0;
+        overflow: hidden;
     }
 
     .log-detail-header {
+        flex: 0 0 auto;
         flex-direction: column;
+        gap: 0.75rem;
+        padding: 1rem;
+    }
+
+    .log-detail-body {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 0.9rem 0.85rem max(2rem, env(safe-area-inset-bottom));
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior: contain;
+        touch-action: pan-y;
+    }
+
+    .log-detail-section {
+        padding: 0.85rem;
+    }
+
+    .log-detail-grid {
+        grid-template-columns: 1fr;
+        gap: 0.65rem;
+    }
+
+    .log-response-code,
+    .log-raw-code {
+        max-height: 46vh;
+        max-height: 46dvh;
+        overflow: auto;
+        -webkit-overflow-scrolling: touch;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
     }
 
     .log-detail-close {
