@@ -7,10 +7,13 @@ and attaches compatibility endpoints that wrap the existing proxy implementation
 import uvicorn
 
 import app_core
+from chat_image_content_compat import install_chat_image_content_compat
 from responses_adapter import register_responses_endpoint
 
 
 app = app_core.app
+
+install_chat_image_content_compat(app_core)
 
 register_responses_endpoint(
     app,
