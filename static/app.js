@@ -79,10 +79,15 @@ document.addEventListener("DOMContentLoaded", () => {
     let statsInterval, logsInterval;
     let allSchemesCache = {}; // 缓存配置数据，用于统计显示
     let configStatsCache = { total: {}, today: {} };
+    let latestStatsData = null;
+    let latestStatsSeq = 0;
+    let isLoadingStats = false;
     let latestLogEntries = [];
     let latestLogSeq = 0;
     let isLoadingLogs = false;
-    const LOG_REQUEST_TIMEOUT_MS = 8000;
+    // 慢速网络下保留完整传输机会；超时后释放加载状态，由后续轮询自动重试。
+    const STATS_REQUEST_TIMEOUT_MS = 60000;
+    const LOG_REQUEST_TIMEOUT_MS = 60000;
 
     const CONFIG_COLLAPSE_STORAGE_KEY = "catfish_config_scheme_collapsed";
     const STATS_COLLAPSE_STORAGE_KEY = "catfish_stats_sections_open";
@@ -522,34 +527,86 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
-    // [重构] 加载统计数据
-    async function loadStats() {
-        try {
-            const response = await authedFetch("/admin/stats");
-            if (!response || !response.ok) return;
-            const stats = await response.json();
-            configStatsCache = {
-                total: stats.by_config_id || {},
-                today: stats.today?.by_config_id || {}
+    function mergeStatsPayload(payload) {
+        const payloadSeq = Number(payload?.seq || 0);
+        if (payload?.mode !== "delta" || !latestStatsData) {
+            latestStatsData = {
+                total: payload?.total || { success: 0, fail: 0 },
+                today: payload?.today || { success: 0, fail: 0, by_config_id: {} },
+                by_config_id: payload?.by_config_id || {},
+                round_robin_state: payload?.round_robin_state || {},
+                by_ip: payload?.by_ip || {}
             };
+            latestStatsSeq = payloadSeq;
+            return latestStatsData;
+        }
 
-            statTotalSuccess.textContent = stats.total.success || 0;
-            statTotalFail.textContent = stats.total.fail || 0;
-            statTodaySuccess.textContent = stats.today.success || 0;
-            statTodayFail.textContent = stats.today.fail || 0;
+        if (payload.total) latestStatsData.total = payload.total;
+        if (payload.today) latestStatsData.today = payload.today;
 
-            const allConfigsFlat = Object.values(allSchemesCache).flat();
+        const byConfig = { ...(latestStatsData.by_config_id || {}) };
+        Object.entries(payload.by_config_id || {}).forEach(([configId, stat]) => {
+            byConfig[configId] = stat;
+        });
+        (payload.deleted_config_ids || []).forEach(configId => {
+            delete byConfig[String(configId)];
+        });
+        latestStatsData.by_config_id = byConfig;
 
-            // 渲染历史总计
-            renderStatsTable(statsByConfigBody, allConfigsFlat, stats.by_config_id, true);
-            // 渲染今日统计
-            renderStatsTable(statsTodayByConfigBody, allConfigsFlat, stats.today.by_config_id, false);
-            // 渲染 IP 请求与封禁统计
-            renderIpStatsTable(statsByIpBody, stats.by_ip || {});
-            refreshConfigStatsBadges();
+        const byIp = { ...(latestStatsData.by_ip || {}) };
+        Object.entries(payload.ip_updates || {}).forEach(([ip, update]) => {
+            const previous = byIp[ip] || {};
+            const previousPaths = previous.paths && typeof previous.paths === "object" ? previous.paths : {};
+            const nextPaths = update?.replace_paths
+                ? { ...(update.paths || {}) }
+                : { ...previousPaths, ...(update?.paths || {}) };
+            byIp[ip] = { ...previous, ...(update?.entry || {}), paths: nextPaths };
+        });
+        (payload.deleted_ip_addresses || []).forEach(ip => {
+            delete byIp[String(ip)];
+        });
+        latestStatsData.by_ip = byIp;
+        latestStatsSeq = Math.max(latestStatsSeq, payloadSeq);
+        return latestStatsData;
+    }
 
+    function renderStats(stats) {
+        configStatsCache = {
+            total: stats.by_config_id || {},
+            today: stats.today?.by_config_id || {}
+        };
+
+        statTotalSuccess.textContent = stats.total?.success || 0;
+        statTotalFail.textContent = stats.total?.fail || 0;
+        statTodaySuccess.textContent = stats.today?.success || 0;
+        statTodayFail.textContent = stats.today?.fail || 0;
+
+        const allConfigsFlat = Object.values(allSchemesCache).flat();
+        renderStatsTable(statsByConfigBody, allConfigsFlat, stats.by_config_id || {}, true);
+        renderStatsTable(statsTodayByConfigBody, allConfigsFlat, stats.today?.by_config_id || {}, false);
+        renderIpStatsTable(statsByIpBody, stats.by_ip || {});
+        refreshConfigStatsBadges();
+    }
+
+    // 首次获取完整统计，后续只合并服务端返回的变化项。
+    async function loadStats() {
+        if (isLoadingStats) return;
+        isLoadingStats = true;
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), STATS_REQUEST_TIMEOUT_MS);
+        try {
+            const query = latestStatsSeq > 0 ? `?after_seq=${encodeURIComponent(latestStatsSeq)}` : "";
+            const response = await authedFetch(`/admin/stats${query}`, { signal: controller.signal });
+            if (!response || !response.ok) return;
+            const payload = await response.json();
+            renderStats(mergeStatsPayload(payload));
         } catch (err) {
-            console.error("加载统计失败:", err);
+            if (err.name !== "AbortError") {
+                console.error("加载统计失败:", err);
+            }
+        } finally {
+            window.clearTimeout(timeoutId);
+            isLoadingStats = false;
         }
     }
     

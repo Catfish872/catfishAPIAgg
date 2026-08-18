@@ -74,8 +74,13 @@ IP_FAILURE_BAN_THRESHOLD = 5
 # 明细数据保留期：累计请求数量长期保留，路径明细和生成图片按 1 个月清理
 DETAIL_RETENTION_DAYS = 30
 DETAIL_RETENTION_SECONDS = DETAIL_RETENTION_DAYS * 24 * 60 * 60
+# 未封禁且超过 1 年没有新访问的 IP 自动清理；封禁记录永久保留
+INACTIVE_IP_RETENTION_DAYS = 365
+INACTIVE_IP_RETENTION_SECONDS = INACTIVE_IP_RETENTION_DAYS * 24 * 60 * 60
 # 单个 IP 最多保留的路径明细数量，避免 stats.json 因资源路径无限增长
 MAX_IP_PATH_STATS = 200
+# 只保存统计变化范围，不保存历史快照；浏览器长时间休眠并落后于窗口时自动回退全量同步
+STATS_CHANGE_HISTORY_LIMIT = 4096
 # 普通统计写盘节流间隔；关键事件仍会强制刷新
 STATS_FLUSH_INTERVAL_SECONDS = 10
 # 生成图片后台清理间隔；磁盘历史文件低频清理，内存图片短 TTL 高频清理
@@ -104,6 +109,8 @@ stats_cache: Optional[dict] = None
 stats_dirty = False
 stats_last_flush_monotonic = 0.0
 stats_last_path_cleanup_date: Optional[str] = None
+stats_sync_sequence = 0
+stats_change_history = collections.deque(maxlen=STATS_CHANGE_HISTORY_LIMIT)
 generated_image_cleanup_task: Optional[asyncio.Task] = None
 stats_flush_task: Optional[asyncio.Task] = None
 memory_generated_images_lock = RLock()
@@ -398,6 +405,9 @@ def _serialize_log_list_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         "error_type", "error_message", "next_attempt"
     )
     result = {key: copy.deepcopy(entry.get(key)) for key in fields if key in entry}
+    # 列表卡片与成功响应摘要采用同一长度边界；只裁剪返回副本，详情仍保留完整错误正文。
+    if result.get("error_message") is not None:
+        result["error_message"] = _short_log_text(result["error_message"], 320)
     result["seq"] = entry.get("_seq", 0)
     result["updated_seq"] = entry.get("_updated_seq", entry.get("_seq", 0))
     result["has_detail"] = True
@@ -705,7 +715,7 @@ async def get_all_schemes() -> Dict[str, List[ApiConfig]]:
 
 
 async def save_all_schemes(schemes: Dict[str, List[ApiConfig]]):
-    """保存所有方案配置，并同步刷新内存缓存。"""
+    """保存所有方案配置，并同步刷新内存缓存及已失效的配置历史统计。"""
     global config_cache
     schemes_data = {}
     for scheme_name, configs in schemes.items():
@@ -718,6 +728,14 @@ async def save_all_schemes(schemes: Dict[str, List[ApiConfig]]):
     await write_json_file(CONFIG_FILE, schemes_data)
     async with config_lock:
         config_cache = copy.deepcopy(schemes_data)
+
+    valid_config_ids = {
+        str(config_data.get("id"))
+        for configs_list in schemes_data.values()
+        for config_data in configs_list
+        if config_data.get("id") is not None
+    }
+    await prune_missing_config_stats(valid_config_ids)
 
 
 # 统计相关的 I/O、缓存与明细清理
@@ -823,19 +841,57 @@ def prune_ip_paths(ip_entry: dict, now_dt: Optional[datetime] = None) -> bool:
     return changed
 
 
-def prune_expired_path_details(stats: dict, force: bool = False) -> bool:
-    """按天轻量清理路径明细，避免每次请求都全量扫描。"""
+def prune_expired_stats_details(
+        stats: dict,
+        force: bool = False
+) -> tuple[bool, set[str], set[str]]:
+    """按天清理路径明细与长期不活跃 IP，并返回需要增量同步的变化范围。"""
     global stats_last_path_cleanup_date
     today = beijing_date_str()
     if not force and stats_last_path_cleanup_date == today:
-        return False
+        return False, set(), set()
 
-    changed = False
-    for entry in stats.get("by_ip", {}).values():
-        if isinstance(entry, dict):
-            changed = prune_ip_paths(entry, beijing_now()) or changed
+    changed_ip_addresses: set[str] = set()
+    deleted_ip_addresses: set[str] = set()
+    now_dt = beijing_now()
+    inactive_cutoff = now_dt - timedelta(seconds=INACTIVE_IP_RETENTION_SECONDS)
+    by_ip = stats.get("by_ip", {})
+
+    if isinstance(by_ip, dict):
+        for ip, entry in list(by_ip.items()):
+            if not isinstance(entry, dict):
+                del by_ip[ip]
+                deleted_ip_addresses.add(str(ip))
+                continue
+
+            # 封禁记录承担安全拦截职责，不能自动删除；缺少最后访问时间的旧记录也保留，避免误判。
+            last_seen = parse_stats_datetime(entry.get("last_seen_at"))
+            if not entry.get("is_banned") and last_seen and last_seen < inactive_cutoff:
+                del by_ip[ip]
+                deleted_ip_addresses.add(str(ip))
+                continue
+
+            if prune_ip_paths(entry, now_dt):
+                changed_ip_addresses.add(str(ip))
+
     stats_last_path_cleanup_date = today
-    return changed
+    changed = bool(changed_ip_addresses or deleted_ip_addresses)
+    return changed, changed_ip_addresses, deleted_ip_addresses
+
+
+def prune_missing_config_stats_unlocked(stats: dict, valid_config_ids: set[str]) -> set[str]:
+    """删除已经不存在配置项的历史总计；全局累计总数与今日统计保持原有含义。"""
+    removed_config_ids: set[str] = set()
+    by_config_id = stats.get("by_config_id")
+    if not isinstance(by_config_id, dict):
+        stats["by_config_id"] = {}
+        return removed_config_ids
+
+    for config_id in list(by_config_id.keys()):
+        if str(config_id) not in valid_config_ids:
+            del by_config_id[config_id]
+            removed_config_ids.add(str(config_id))
+    return removed_config_ids
 
 
 def normalize_stats_structure(stats: Any) -> dict:
@@ -867,8 +923,8 @@ def normalize_stats_structure(stats: Any) -> dict:
         if not isinstance(entry, dict):
             del stats["by_ip"][ip]
             continue
+        # 此处只补齐旧数据字段；过期删除统一交给可记录增量范围的清理阶段。
         ensure_ip_stats_entry(stats, ip)
-        prune_ip_paths(entry, beijing_now())
 
     return stats
 
@@ -921,10 +977,77 @@ async def flush_stats_if_needed(force: bool = False):
         log_message(f"写入 {STATS_FILE} 失败: {e}")
 
 
-async def mark_stats_dirty(force_flush: bool = False):
-    """标记统计缓存已变更；可在 stats_lock 内部调用，不能再次获取同一把锁。"""
+def _normalize_stats_ip_path_changes(
+        value: Optional[Dict[str, set[str]]]
+) -> Dict[str, set[str]]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(ip): {str(path) for path in paths}
+        for ip, paths in value.items()
+        if paths
+    }
+
+
+def _record_stats_change_unlocked(
+        *,
+        total_changed: bool = False,
+        today_changed: bool = False,
+        today_reset: bool = False,
+        config_ids: Optional[set[str]] = None,
+        replace_ip_addresses: Optional[set[str]] = None,
+        ip_paths: Optional[Dict[str, set[str]]] = None,
+        deleted_config_ids: Optional[set[str]] = None,
+        deleted_ip_addresses: Optional[set[str]] = None,
+        full_snapshot_required: bool = False
+) -> int:
+    """只记录变化范围，不复制历史统计正文；调用方必须已经持有 stats_lock。"""
+    global stats_sync_sequence
+    stats_sync_sequence += 1
+    stats_change_history.append({
+        "seq": stats_sync_sequence,
+        "total_changed": bool(total_changed),
+        "today_changed": bool(today_changed),
+        "today_reset": bool(today_reset),
+        "config_ids": set(config_ids or set()),
+        "replace_ip_addresses": set(replace_ip_addresses or set()),
+        "ip_paths": _normalize_stats_ip_path_changes(ip_paths),
+        "deleted_config_ids": set(deleted_config_ids or set()),
+        "deleted_ip_addresses": set(deleted_ip_addresses or set()),
+        "full_snapshot_required": bool(full_snapshot_required)
+    })
+    return stats_sync_sequence
+
+
+async def mark_stats_dirty(
+        force_flush: bool = False,
+        *,
+        total_changed: bool = False,
+        today_changed: bool = False,
+        today_reset: bool = False,
+        config_ids: Optional[set[str]] = None,
+        replace_ip_addresses: Optional[set[str]] = None,
+        ip_paths: Optional[Dict[str, set[str]]] = None,
+        deleted_config_ids: Optional[set[str]] = None,
+        deleted_ip_addresses: Optional[set[str]] = None,
+        full_snapshot_required: bool = False,
+        record_sync_change: bool = True
+):
+    """标记统计缓存与前端同步范围已变更；调用方必须已经持有 stats_lock。"""
     global stats_dirty
     stats_dirty = True
+    if record_sync_change:
+        _record_stats_change_unlocked(
+            total_changed=total_changed,
+            today_changed=today_changed,
+            today_reset=today_reset,
+            config_ids=config_ids,
+            replace_ip_addresses=replace_ip_addresses,
+            ip_paths=ip_paths,
+            deleted_config_ids=deleted_config_ids,
+            deleted_ip_addresses=deleted_ip_addresses,
+            full_snapshot_required=full_snapshot_required
+        )
     if force_flush:
         await flush_stats_if_needed(force=True)
 
@@ -944,10 +1067,19 @@ def reset_today_if_needed_unlocked(stats: dict) -> bool:
 
 async def init_stats_cache() -> dict:
     global stats_cache, stats_dirty
+    config_data = await get_config_cache_data()
+    valid_config_ids = {
+        str(config.get("id"))
+        for configs in config_data.values()
+        for config in configs
+        if config.get("id") is not None
+    }
     async with stats_lock:
         stats_cache = await load_stats_from_disk()
-        changed = reset_today_if_needed_unlocked(stats_cache)
-        changed = prune_expired_path_details(stats_cache, force=True) or changed
+        today_reset = reset_today_if_needed_unlocked(stats_cache)
+        cleanup_changed, _, _ = prune_expired_stats_details(stats_cache, force=True)
+        removed_config_ids = prune_missing_config_stats_unlocked(stats_cache, valid_config_ids)
+        changed = today_reset or cleanup_changed or bool(removed_config_ids)
         stats_dirty = stats_dirty or changed
         snapshot = copy.deepcopy(stats_cache)
     if changed:
@@ -955,19 +1087,48 @@ async def init_stats_cache() -> dict:
     return snapshot
 
 
+async def _apply_scheduled_stats_cleanup_unlocked(stats: dict) -> bool:
+    """执行低频清理并记录精确同步范围；调用方必须已经持有 stats_lock。"""
+    today_reset = reset_today_if_needed_unlocked(stats)
+    cleanup_changed, changed_ips, deleted_ips = prune_expired_stats_details(stats)
+    if not today_reset and not cleanup_changed:
+        return False
+
+    await mark_stats_dirty(
+        False,
+        today_changed=today_reset,
+        today_reset=today_reset,
+        replace_ip_addresses=changed_ips,
+        deleted_ip_addresses=deleted_ips
+    )
+    return True
+
+
 async def get_stats() -> dict:
     """获取统计数据；缓存优先，避免统计页轮询反复读盘。"""
-    global stats_cache, stats_dirty
+    global stats_cache
     async with stats_lock:
         if stats_cache is None:
             stats_cache = await load_stats_from_disk()
-        changed = reset_today_if_needed_unlocked(stats_cache)
-        changed = prune_expired_path_details(stats_cache) or changed
-        stats_dirty = stats_dirty or changed
+        changed = await _apply_scheduled_stats_cleanup_unlocked(stats_cache)
         snapshot = copy.deepcopy(stats_cache)
     if changed:
         await flush_stats_if_needed()
     return snapshot
+
+
+async def prune_missing_config_stats(valid_config_ids: set[str]) -> set[str]:
+    """配置保存后清理已经不存在的配置项历史总计，并通知统计增量客户端删除。"""
+    global stats_cache
+    async with stats_lock:
+        if stats_cache is None:
+            stats_cache = await load_stats_from_disk()
+        removed_config_ids = prune_missing_config_stats_unlocked(stats_cache, valid_config_ids)
+        if removed_config_ids:
+            await mark_stats_dirty(False, deleted_config_ids=removed_config_ids)
+    if removed_config_ids:
+        await flush_stats_if_needed(force=True)
+    return removed_config_ids
 
 
 async def read_stats_unlocked() -> dict:
@@ -976,12 +1137,135 @@ async def read_stats_unlocked() -> dict:
 
 
 async def write_stats_unlocked(stats: dict):
-    """兼容旧调用名：更新内存缓存并节流落盘。"""
-    global stats_cache, stats_dirty
+    """兼容旧调用名：更新内存缓存并要求增量客户端重新获取完整快照。"""
+    global stats_cache
     async with stats_lock:
         stats_cache = normalize_stats_structure(stats)
-        stats_dirty = True
+        await mark_stats_dirty(False, full_snapshot_required=True)
     await flush_stats_if_needed()
+
+
+def _stats_snapshot_payload_unlocked(stats: dict) -> Dict[str, Any]:
+    payload = copy.deepcopy(stats)
+    payload.update({
+        "version": 2,
+        "mode": "snapshot",
+        "seq": stats_sync_sequence
+    })
+    return payload
+
+
+def _stats_delta_payload_unlocked(stats: dict, after_seq: int) -> Dict[str, Any]:
+    """根据变化范围构造小体积增量；调用方必须已经持有 stats_lock。"""
+    current_seq = stats_sync_sequence
+    if after_seq <= 0 or after_seq > current_seq:
+        return _stats_snapshot_payload_unlocked(stats)
+    if after_seq == current_seq:
+        return {
+            "version": 2,
+            "mode": "delta",
+            "seq": current_seq,
+            "ip_updates": {},
+            "deleted_ip_addresses": [],
+            "by_config_id": {},
+            "deleted_config_ids": []
+        }
+
+    history = list(stats_change_history)
+    if not history or after_seq < int(history[0].get("seq", 0)) - 1:
+        return _stats_snapshot_payload_unlocked(stats)
+
+    changes = [item for item in history if int(item.get("seq", 0)) > after_seq]
+    if not changes or any(item.get("full_snapshot_required") for item in changes):
+        return _stats_snapshot_payload_unlocked(stats)
+
+    total_changed = any(item.get("total_changed") for item in changes)
+    today_changed = any(item.get("today_changed") for item in changes)
+    config_ids: set[str] = set()
+    replace_ip_addresses: set[str] = set()
+    changed_ip_paths: Dict[str, set[str]] = {}
+    deleted_config_ids: set[str] = set()
+    deleted_ip_addresses: set[str] = set()
+
+    for item in changes:
+        config_ids.update(item.get("config_ids") or set())
+        replace_ip_addresses.update(item.get("replace_ip_addresses") or set())
+        deleted_config_ids.update(item.get("deleted_config_ids") or set())
+        deleted_ip_addresses.update(item.get("deleted_ip_addresses") or set())
+        for ip, paths in (item.get("ip_paths") or {}).items():
+            changed_ip_paths.setdefault(str(ip), set()).update(paths)
+
+    current_by_config = stats.get("by_config_id", {})
+    current_by_ip = stats.get("by_ip", {})
+    config_updates = {
+        config_id: copy.deepcopy(current_by_config[config_id])
+        for config_id in config_ids
+        if config_id in current_by_config
+    }
+
+    # 删除后又重新出现的记录以当前状态为准，不能让浏览器误删新数据。
+    deleted_config_ids = {
+        config_id for config_id in deleted_config_ids
+        if config_id not in current_by_config
+    }
+    deleted_ip_addresses = {
+        ip for ip in deleted_ip_addresses
+        if ip not in current_by_ip
+    }
+
+    ip_updates: Dict[str, Any] = {}
+    for ip in replace_ip_addresses | set(changed_ip_paths.keys()):
+        current_entry = current_by_ip.get(ip)
+        if not isinstance(current_entry, dict):
+            continue
+        replace_paths = ip in replace_ip_addresses
+        entry_without_paths = {
+            key: copy.deepcopy(value)
+            for key, value in current_entry.items()
+            if key != "paths"
+        }
+        current_paths = current_entry.get("paths", {})
+        if replace_paths:
+            paths = copy.deepcopy(current_paths) if isinstance(current_paths, dict) else {}
+        else:
+            paths = {
+                path: copy.deepcopy(current_paths[path])
+                for path in changed_ip_paths.get(ip, set())
+                if isinstance(current_paths, dict) and path in current_paths
+            }
+        ip_updates[ip] = {
+            "entry": entry_without_paths,
+            "replace_paths": replace_paths,
+            "paths": paths
+        }
+
+    payload: Dict[str, Any] = {
+        "version": 2,
+        "mode": "delta",
+        "seq": current_seq,
+        "ip_updates": ip_updates,
+        "deleted_ip_addresses": sorted(deleted_ip_addresses),
+        "by_config_id": config_updates,
+        "deleted_config_ids": sorted(deleted_config_ids)
+    }
+    if total_changed:
+        payload["total"] = copy.deepcopy(stats.get("total", {}))
+    if today_changed:
+        payload["today"] = copy.deepcopy(stats.get("today", {}))
+    return payload
+
+
+async def get_stats_sync_payload(after_seq: int = 0) -> Dict[str, Any]:
+    """返回首次完整统计或指定序号之后的变化；过期序号自动回退完整快照。"""
+    global stats_cache
+    async with stats_lock:
+        if stats_cache is None:
+            stats_cache = await load_stats_from_disk()
+        changed = await _apply_scheduled_stats_cleanup_unlocked(stats_cache)
+        payload = _stats_delta_payload_unlocked(stats_cache, after_seq)
+    if changed:
+        await flush_stats_if_needed()
+    return payload
 
 
 def normalize_ip_candidate(value: Optional[str]) -> Optional[str]:
@@ -1032,10 +1316,17 @@ def is_admin_authorization_valid(request: Request) -> bool:
 
 
 async def get_ip_stats_entry(ip: str) -> Optional[dict]:
-    """读取指定 IP 的统计项；缓存优先。"""
-    stats = await get_stats()
-    entry = stats.get("by_ip", {}).get(ip)
-    return entry if isinstance(entry, dict) else None
+    """只复制指定 IP 的统计项，避免每次封禁检查都复制整份统计。"""
+    global stats_cache
+    async with stats_lock:
+        if stats_cache is None:
+            stats_cache = await load_stats_from_disk()
+        changed = await _apply_scheduled_stats_cleanup_unlocked(stats_cache)
+        entry = stats_cache.get("by_ip", {}).get(ip)
+        snapshot = copy.deepcopy(entry) if isinstance(entry, dict) else None
+    if changed:
+        await flush_stats_if_needed()
+    return snapshot
 
 
 async def record_ip_request_seen(ip: str, path: str = "/"):
@@ -1047,15 +1338,21 @@ async def record_ip_request_seen(ip: str, path: str = "/"):
             current_stats = await load_stats_from_disk()
             globals()["stats_cache"] = current_stats
         stats = stats_cache
-        reset_today_if_needed_unlocked(stats)
+        today_reset = reset_today_if_needed_unlocked(stats)
         entry = ensure_ip_stats_entry(stats, ip)
         entry["total"] = int(entry.get("total", 0) or 0) + 1
         entry["last_seen_at"] = now_str
         path_entry = ensure_ip_path_entry(entry, normalized_path)
         path_entry["total"] = int(path_entry.get("total", 0) or 0) + 1
         path_entry["last_seen_at"] = now_str
-        prune_ip_paths(entry, beijing_now())
-        await mark_stats_dirty(False)
+        paths_pruned = prune_ip_paths(entry, beijing_now())
+        await mark_stats_dirty(
+            False,
+            today_changed=today_reset,
+            today_reset=today_reset,
+            replace_ip_addresses={ip} if paths_pruned else None,
+            ip_paths=None if paths_pruned else {ip: {normalized_path}}
+        )
     await flush_stats_if_needed()
 
 
@@ -1071,7 +1368,7 @@ async def record_ip_auth_result(request: Request, is_success: bool, reason: str 
             current_stats = await load_stats_from_disk()
             globals()["stats_cache"] = current_stats
         stats = stats_cache
-        reset_today_if_needed_unlocked(stats)
+        today_reset = reset_today_if_needed_unlocked(stats)
         entry = ensure_ip_stats_entry(stats, ip)
         entry["last_seen_at"] = now_str
         path_entry = ensure_ip_path_entry(entry, path)
@@ -1096,8 +1393,14 @@ async def record_ip_auth_result(request: Request, is_success: bool, reason: str 
                 should_force_flush = True
                 log_message(f"IP 自动封禁: {ip} 连续认证失败 {entry['consecutive_fails']} 次，已永久封禁，需控制台手动解除")
 
-        prune_ip_paths(entry, beijing_now())
-        await mark_stats_dirty(False)
+        paths_pruned = prune_ip_paths(entry, beijing_now())
+        await mark_stats_dirty(
+            False,
+            today_changed=today_reset,
+            today_reset=today_reset,
+            replace_ip_addresses={ip} if paths_pruned else None,
+            ip_paths=None if paths_pruned else {ip: {path}}
+        )
     await flush_stats_if_needed(force=should_force_flush)
 
 
@@ -1135,7 +1438,7 @@ async def update_stats_and_state(
             current_stats = await load_stats_from_disk()
             globals()["stats_cache"] = current_stats
         stats = stats_cache
-        reset_today_if_needed_unlocked(stats)
+        today_reset = reset_today_if_needed_unlocked(stats)
 
         key = "success" if is_success else "fail"
         stats["total"][key] = stats["total"].get(key, 0) + 1
@@ -1178,7 +1481,13 @@ async def update_stats_and_state(
             next_index = (success_index_in_group + 1) % len(priority_group) if priority_group else 0
             stats["round_robin_state"][scheme_name][str(config.priority)] = next_index
 
-        await mark_stats_dirty(False)
+        await mark_stats_dirty(
+            False,
+            total_changed=True,
+            today_changed=True,
+            today_reset=today_reset,
+            config_ids={str(config.id)}
+        )
     await flush_stats_if_needed(force=should_force_flush)
 
 
@@ -1200,7 +1509,8 @@ async def advance_round_robin_state_only(
             stats["round_robin_state"][scheme_name] = {}
         next_index = (success_index_in_group + 1) % len(priority_group) if priority_group else 0
         stats["round_robin_state"][scheme_name][str(config.priority)] = next_index
-        await mark_stats_dirty(False)
+        # round_robin_state 是内部路由游标，只需落盘，不占用前端统计变化窗口。
+        await mark_stats_dirty(False, record_sync_change=False)
     await flush_stats_if_needed()
 
 
@@ -3644,9 +3954,9 @@ async def delete_config(config_id: str):
 
 
 @admin_router.get("/stats")
-async def get_statistics():
-    """获取请求统计数据 (包含日期重置逻辑)"""
-    return await get_stats()
+async def get_statistics(after_seq: int = 0):
+    """首次返回完整统计；after_seq 存在时只返回该序号之后发生变化的统计项。"""
+    return await get_stats_sync_payload(after_seq)
 
 
 @admin_router.post("/stats/config/{config_id}/unblock")
@@ -3668,7 +3978,7 @@ async def unblock_config(config_id: str):
             config_stats["consecutive_fails"] = 0
             changed = True
         if changed:
-            await mark_stats_dirty(False)
+            await mark_stats_dirty(False, config_ids={str(config_id)})
 
     if changed:
         await flush_stats_if_needed(force=True)
@@ -3699,7 +4009,7 @@ async def unblock_ip(ip: str):
             ip_stats["consecutive_fails"] = 0
             changed = True
         if changed:
-            await mark_stats_dirty(False)
+            await mark_stats_dirty(False, replace_ip_addresses={str(ip)})
 
     if changed:
         await flush_stats_if_needed(force=True)
