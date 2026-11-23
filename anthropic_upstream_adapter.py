@@ -2,7 +2,7 @@ import copy
 import json
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from anthropic_adapter import AnthropicAdapterError, _as_text, extract_text_from_anthropic_content
 
@@ -580,9 +580,16 @@ def openai_injected_message_to_anthropic_fragment(message: Dict[str, Any]) -> Op
     return _openai_message_to_anthropic_message(message)
 
 
-def anthropic_response_to_openai_stream_events(payload: Dict[str, Any], original_body: Dict[str, Any]) -> List[bytes]:
-    """Anthropic 非流响应 -> OpenAI SSE，用于假流式。"""
+def anthropic_response_to_openai_stream_events(
+        payload: Dict[str, Any],
+        original_body: Dict[str, Any],
+        *,
+        transform: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+) -> List[bytes]:
+    """将完整的 Anthropic 响应转换为 OpenAI 流式事件。"""
     openai_payload = anthropic_response_to_openai_chat(payload, original_body)
+    if transform is not None:
+        openai_payload = transform(openai_payload)
     choice = openai_payload.get("choices", [{}])[0]
     message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
     events: List[bytes] = []

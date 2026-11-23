@@ -53,6 +53,9 @@ document.addEventListener("DOMContentLoaded", () => {
     const configStreamModeStrategyInput = document.getElementById("config-stream-mode-strategy");
     const injectedMessagesEditor = document.getElementById("injected-messages-editor");
     const addInjectedMessageButton = document.getElementById("add-injected-message-button");
+    const responseTextRulesEditor = document.getElementById("response-text-rules-editor");
+    const responseTextRuleTemplate = document.getElementById("response-text-rule-template");
+    const addResponseTextRuleButton = document.getElementById("add-response-text-rule");
     const presetTableBody = document.getElementById("preset-table-body");
     const saveButton = document.getElementById("save-button");
     const cancelButton = document.getElementById("cancel-button");
@@ -1240,6 +1243,7 @@ document.addEventListener("DOMContentLoaded", () => {
         configImageCustomReferenceObjectUrlFieldInput.value = "image_url";
         updateImageOptionsVisibility();
         renderInjectedMessagesEditor([]);
+        renderResponseTextRules([]);
         cancelButton.classList.add("hidden");
     }
 
@@ -1274,6 +1278,7 @@ document.addEventListener("DOMContentLoaded", () => {
         resetModelPicker("可查询并选择该 URL 下的模型");
         configStreamModeStrategyInput.value = config.stream_mode_strategy || "passthrough";
         renderInjectedMessagesEditor(config.injected_messages || [], config.injection_position || "prepend");
+        renderResponseTextRules(config.response_text_rules ?? []);
         cancelButton.classList.remove("hidden");
         configForm.scrollIntoView({ behavior: areEffectsEnabled() ? "smooth" : "auto", block: "start" });
     }
@@ -1309,6 +1314,7 @@ document.addEventListener("DOMContentLoaded", () => {
             image_task_poll_timeout_seconds: overrides.image_task_poll_timeout_seconds ?? config.image_task_poll_timeout_seconds ?? 300,
             image_task_poll_interval_seconds: overrides.image_task_poll_interval_seconds ?? config.image_task_poll_interval_seconds ?? 2,
             injected_messages: overrides.injected_messages ?? config.injected_messages ?? [],
+            response_text_rules: overrides.response_text_rules ?? config.response_text_rules ?? [],
             consecutive_failure_threshold: overrides.consecutive_failure_threshold ?? config.consecutive_failure_threshold ?? null,
             disable_duration_seconds: overrides.disable_duration_seconds ?? config.disable_duration_seconds ?? null,
         };
@@ -1416,6 +1422,7 @@ document.addEventListener("DOMContentLoaded", () => {
             image_task_poll_timeout_seconds: configImageTaskPollTimeoutInput.value ? parseInt(configImageTaskPollTimeoutInput.value, 10) : 300,
             image_task_poll_interval_seconds: configImageTaskPollIntervalInput.value ? parseFloat(configImageTaskPollIntervalInput.value) : 2,
             injected_messages: getInjectedMessagesFromEditor(),
+            response_text_rules: getResponseTextRules(),
             consecutive_failure_threshold: configFailureThresholdInput.value ? parseInt(configFailureThresholdInput.value, 10) : null,
             disable_duration_seconds: configDisableDurationInput.value ? parseInt(configDisableDurationInput.value, 10) : null,
         });
@@ -1438,7 +1445,10 @@ document.addEventListener("DOMContentLoaded", () => {
                 await loadStats();   // 重新加载统计
             } else {
                 const error = await response.json();
-                alert(`保存失败: ${error.detail || response.statusText}`);
+                const detail = Array.isArray(error.detail)
+                    ? error.detail.map(issue => issue.msg.replace(/^Value error, /, "")).join("\n")
+                    : error.detail;
+                alert(`保存失败\n${detail || response.statusText}`);
             }
         } catch (err) {
             alert(`保存时发生错误: ${err.message}`);
@@ -1723,6 +1733,48 @@ document.addEventListener("DOMContentLoaded", () => {
         return result;
     }
 
+    function createResponseTextRuleRow(rule = { kind: "tag_pair", pattern: "", replacement: "" }) {
+        const row = responseTextRuleTemplate.content.firstElementChild.cloneNode(true);
+        const kind = row.querySelector("[data-rule-kind]");
+        const tagFields = row.querySelector("[data-tag-fields]");
+        const regexFields = row.querySelector("[data-regex-fields]");
+        kind.value = rule.kind;
+        if (rule.kind === "tag_pair") {
+            row.querySelector("[data-tag-pair]").value = rule.pattern;
+        } else {
+            row.querySelector("[data-regex-pattern]").value = rule.pattern;
+            row.querySelector("[data-regex-replacement]").value = rule.replacement;
+        }
+
+        function updateRuleFields() {
+            const isTagPair = kind.value === "tag_pair";
+            tagFields.classList.toggle("hidden", !isTagPair);
+            regexFields.classList.toggle("hidden", isTagPair);
+        }
+        kind.addEventListener("change", updateRuleFields);
+        row.querySelector("[data-remove-rule]").addEventListener("click", () => row.remove());
+        updateRuleFields();
+        return row;
+    }
+
+    function renderResponseTextRules(rules) {
+        responseTextRulesEditor.replaceChildren(...rules.map(rule => createResponseTextRuleRow(rule)));
+    }
+
+    function getResponseTextRules() {
+        return Array.from(responseTextRulesEditor.children, row => {
+            const kind = row.querySelector("[data-rule-kind]").value;
+            if (kind === "tag_pair") {
+                return { kind, pattern: row.querySelector("[data-tag-pair]").value };
+            }
+            return {
+                kind,
+                pattern: row.querySelector("[data-regex-pattern]").value,
+                replacement: row.querySelector("[data-regex-replacement]").value,
+            };
+        });
+    }
+
     function initStatsCollapseState() {
         const state = getJsonStorageMap(STATS_COLLAPSE_STORAGE_KEY);
         document.querySelectorAll(".stats-collapse-card[data-stats-collapse-key]").forEach(details => {
@@ -1831,6 +1883,11 @@ document.addEventListener("DOMContentLoaded", () => {
                 content: "",
                 position: configInjectionPositionInput.value || "prepend"
             }));
+        });
+        addResponseTextRuleButton.addEventListener("click", () => {
+            const row = createResponseTextRuleRow();
+            responseTextRulesEditor.appendChild(row);
+            row.querySelector("[data-tag-pair]").focus();
         });
         configUserAgentModeInput.addEventListener("change", updateCustomUserAgentVisibility);
         configEndpointPresetInput.addEventListener("change", updateImageOptionsVisibility);
