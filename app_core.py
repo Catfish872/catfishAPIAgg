@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from threading import RLock
 from functools import lru_cache
 from pydantic import BaseModel, Field, validator
-from typing import List, Optional, Any, Dict, Literal
+from typing import List, Optional, Any, Dict, Literal, NamedTuple
 from itertools import groupby
 from urllib.parse import urljoin
 
@@ -49,6 +49,7 @@ from anthropic_upstream_adapter import (
     openai_chat_to_anthropic_request,
     openai_injected_message_to_anthropic_fragment,
 )
+from responses_adapter import ChatRequestProxy
 
 # --- 1. 全局配置和初始化 ---
 
@@ -1481,7 +1482,6 @@ async def update_stats_and_state(
         success_index_in_group: int,
         advance_round_robin: bool = True,
         *,
-        body_error: Optional[str] = None,
         track_stream_success: bool = False,
 ) -> Optional[tuple[dict, dict, dict, dict]]:
     """更新统计和路由状态。正文错误只影响成功和失败的计数。"""
@@ -1494,7 +1494,7 @@ async def update_stats_and_state(
         stats = stats_cache
         today_reset = reset_today_if_needed_unlocked(stats)
 
-        key = "success" if is_success and body_error is None else "fail"
+        key = "success" if is_success else "fail"
         stats["total"][key] = stats["total"].get(key, 0) + 1
         stats["today"][key] = stats["today"].get(key, 0) + 1
 
@@ -1989,10 +1989,10 @@ def remove_paired_response_tags(text: str, delimiters: re.Pattern, opening: str)
 
 
 def rewrite_complete_response_text(
-        payload: Any, rules: List[ResponseTextRule], body_error: Optional[str] = None, *, anthropic: bool = False,
+        payload: Any, rules: List[ResponseTextRule], *, anthropic: bool = False,
 ) -> Any:
     """在原有日志写入后处理助手文字，仅复制送往客户端的文字字段所在结构。"""
-    if not rules or body_error or not isinstance(payload, dict):
+    if not rules or not isinstance(payload, dict):
         return payload
 
     compiled_rules = [
@@ -2120,6 +2120,9 @@ def extract_image_task_poll_url(payload: Any, upstream_base_url: str, request_pa
     return f"{upstream_base_url.rstrip('/')}{poll_path}"
 
 
+IMAGE_TASK_FAILURE_STATUSES = {"failed", "failure", "error", "cancelled", "canceled", "refunded", "expired"}
+
+
 async def resolve_images_response_with_auto_poll(
         initial_response: httpx.Response,
         upstream_base_url: str,
@@ -2128,15 +2131,16 @@ async def resolve_images_response_with_auto_poll(
         config: ApiConfig,
         ensure_client_connected,
         on_task_accepted=None
-) -> tuple[Dict[str, Any], int]:
+) -> Dict[str, Any]:
     """处理图片响应：同步 data 直返；HTTP 202 + task_id 自动轮询同一上游任务。"""
     try:
         payload = initial_response.json()
     except Exception as e:
         raise EndpointPresetError(f"上游 images 响应不是有效 JSON: {e}")
 
+    raise_for_buffered_upstream_error(initial_response.status_code, payload, image_task=True)
     if image_response_has_data(payload):
-        return payload, initial_response.status_code
+        return payload
 
     if initial_response.status_code != 202:
         raise EndpointPresetError("上游 images 响应缺少 data 数组")
@@ -2161,7 +2165,6 @@ async def resolve_images_response_with_auto_poll(
         await on_task_accepted(task_id, poll_url)
 
     waiting_statuses = {"queued", "pending", "running", "processing", "in_progress", "created", "accepted"}
-    failure_statuses = {"failed", "failure", "error", "cancelled", "canceled", "refunded", "expired"}
 
     deadline = beijing_now() + timedelta(seconds=timeout_seconds)
     poll_count = 0
@@ -2179,14 +2182,15 @@ async def resolve_images_response_with_auto_poll(
             current_payload = response.json()
         except Exception as e:
             raise EndpointPresetError(f"图片任务 {task_id} 查询响应不是有效 JSON: {e}")
+        raise_for_buffered_upstream_error(response.status_code, current_payload, image_task=True)
         last_payload = current_payload
 
         if image_response_has_data(current_payload):
             log_message(f"图片任务 {task_id} 第 {poll_count} 次查询获得最终 data")
-            return current_payload, response.status_code
+            return current_payload
 
         status = extract_image_task_status(current_payload)
-        if status in failure_statuses:
+        if status in IMAGE_TASK_FAILURE_STATUSES:
             raise EndpointPresetError(f"图片任务 {task_id} 状态失败: {status}")
         if status and status not in waiting_statuses:
             log_message(f"图片任务 {task_id} 返回未知状态 '{status}'，继续等待直到超时")
@@ -2245,6 +2249,13 @@ class UpstreamStreamErrorObserver:
         self._event_name = b""
         self._data: list[bytes] = []
         self._skip_lf = False
+        self.error_payload: Any = None
+
+    def _detect_error(self, payload: Any, *, anthropic: bool, error_event: bool = False) -> Optional[str]:
+        error = upstream_body_error(payload, anthropic=anthropic, error_event=error_event)
+        if error:
+            self.error_payload = payload
+        return error
 
     def _finish_event(self) -> Optional[str]:
         event_name, lines = self._event_name, self._data
@@ -2260,7 +2271,7 @@ class UpstreamStreamErrorObserver:
             if error_event and (payload is None or isinstance(payload, str)):
                 message = payload if isinstance(payload, str) else data.decode("utf-8", errors="replace")
                 payload = {"message": message}
-            return upstream_body_error(payload, anthropic=True, error_event=error_event)
+            return self._detect_error(payload, anthropic=True, error_event=error_event)
         return None
 
     def _line(self, line: bytes) -> Optional[str]:
@@ -2311,7 +2322,7 @@ class UpstreamStreamErrorObserver:
 
     def finish(self) -> Optional[str]:
         if self._format == "json":
-            return upstream_body_error(_decode_upstream_body(self._json), anthropic=self._anthropic)
+            return self._detect_error(_decode_upstream_body(self._json), anthropic=self._anthropic)
         if self._pending:
             error = self._line(self._pending)
             if error:
@@ -2319,24 +2330,66 @@ class UpstreamStreamErrorObserver:
         return self._finish_event()
 
 
-def observe_buffered_upstream_error(
-        entry: Dict[str, Any],
+class UpstreamBodyError(Exception):
+    """上游以 HTTP 200 返回了完整、明确的错误正文。"""
+
+    def __init__(self, message: str, payload: Any, *, code: Optional[str] = None):
+        super().__init__(message)
+        self.payload = payload
+        details = payload.get("error", payload) if isinstance(payload, dict) else {}
+        if not isinstance(details, dict):
+            details = {}
+        kind = details.get("type")
+        raw_code = details.get("code")
+        if isinstance(raw_code, (str, int)) and not isinstance(raw_code, bool):
+            code = raw_code
+        self.response_payload = {
+            "error": {
+                "message": message,
+                "type": kind if isinstance(kind, str) and kind not in ("", "error") else "api_error",
+                "code": code,
+            }
+        }
+
+
+def raise_for_buffered_upstream_error(
         status_code: int,
         payload: Any = None,
         *,
         stream_bytes: Optional[bytes] = None,
         anthropic: bool = False,
-) -> Optional[str]:
+        image_task: bool = False,
+) -> None:
     if status_code != 200:
-        return None
+        return
     if stream_bytes is None:
         error = upstream_body_error(payload, anthropic=anthropic)
     else:
         observer = UpstreamStreamErrorObserver(anthropic=anthropic)
         error = observer.feed(stream_bytes) or observer.finish()
+        payload = observer.error_payload
     if error:
-        entry["_upstream_body_error"] = error
-    return error
+        raise UpstreamBodyError(error, payload)
+    if image_task:
+        status = extract_image_task_status(payload)
+        if status in IMAGE_TASK_FAILURE_STATUSES:
+            raise UpstreamBodyError(f"上游图片任务状态失败: {status}", payload, code=status)
+
+
+def log_buffered_upstream_error(entry: Dict[str, Any], error: UpstreamBodyError) -> None:
+    attach_attempt_response_body(entry, error.payload)
+    add_attempt_log_event(
+        entry,
+        "upstream_body_error",
+        f"配置项 ID: {entry['config_id']} 上游响应正文报错 (HTTP 200): {error}",
+        status="failed",
+        status_label="上游正文错误",
+        title="上游正文错误",
+        finish=True,
+        http_status=200,
+        error_type="UpstreamBodyError",
+        error_message=str(error),
+    )
 
 
 async def record_stream_upstream_error(
@@ -2544,6 +2597,15 @@ def convert_sse_bytes_to_non_stream_json(sse_bytes: bytes) -> Dict[str, Any]:
     return convert_stream_events_to_non_stream_json(events)
 
 
+class AnthropicNativeFailure(NamedTuple):
+    response: Response
+    attempted_config_ids: set[str]
+
+
+class AnthropicCompatibilityRequest(ChatRequestProxy):
+    native_failure: Optional[AnthropicNativeFailure] = None
+
+
 @app.post("/v1/chat/completions", tags=["Proxy"])
 async def proxy_chat_completions(
         request: Request,
@@ -2570,10 +2632,13 @@ async def proxy_chat_completions(
 
     is_stream = request_body.get("stream", False)
     requested_model = request_body.get("model")
+    native_failure = request.native_failure if isinstance(request, AnthropicCompatibilityRequest) else None
 
     # --- 1. 获取方案配置 ---
     all_schemes = await get_all_schemes()
     if not all_schemes:
+        if native_failure is not None:
+            return native_failure.response
         log_message("代理失败: 没有任何 API 配置")
         return JSONResponse(status_code=500, content={"error": "没有配置可用的 API 后端"})
 
@@ -2594,6 +2659,8 @@ async def proxy_chat_completions(
     # 过滤掉被熔断的配置
     active_configs = []
     for config in target_scheme_configs:
+        if native_failure is not None and config.id in native_failure.attempted_config_ids:
+            continue
         config_stats = stats.get("by_config_id", {}).get(config.id, {})
         disabled_until_str = config_stats.get("disabled_until")
         if disabled_until_str:
@@ -2604,6 +2671,8 @@ async def proxy_chat_completions(
         active_configs.append(config)
 
     if not active_configs:
+        if native_failure is not None:
+            return native_failure.response
         log_message(f"方案 '{scheme_name}' 中的所有配置项都处于熔断状态。")
         return JSONResponse(status_code=503, content={"error": "所有后端服务当前都不可用"})
 
@@ -2771,7 +2840,7 @@ async def proxy_chat_completions(
                         )
                         await advance_round_robin_state_only(config, scheme_name, original_group, success_index_in_group)
 
-                    response_json, result_status = await resolve_images_response_with_auto_poll(
+                    response_json = await resolve_images_response_with_auto_poll(
                         response,
                         upstream_base_url.rstrip('/'),
                         images_path,
@@ -2780,7 +2849,6 @@ async def proxy_chat_completions(
                         ensure_client_connected,
                         on_task_accepted=on_image_task_accepted
                     )
-                    body_error = observe_buffered_upstream_error(attempt_entry, result_status, response_json)
                     image_public_url_prefix = str(request.base_url).rstrip("/") + GENERATED_IMAGES_ROUTE
                     response_json = normalize_image_response_urls(response_json, upstream_base_url)
                     response_json = convert_response_base64_images_to_urls(
@@ -2820,7 +2888,6 @@ async def proxy_chat_completions(
                         original_group,
                         success_index_in_group,
                         advance_round_robin=not image_task_accepted,
-                        body_error=body_error,
                     )
 
                     if request_body.get("stream", False):
@@ -3079,8 +3146,8 @@ async def proxy_chat_completions(
                             )
 
                         stream_bytes = await response.aread()
-                        body_error = observe_buffered_upstream_error(
-                            attempt_entry, response.status_code, stream_bytes=stream_bytes, anthropic=True,
+                        raise_for_buffered_upstream_error(
+                            response.status_code, stream_bytes=stream_bytes, anthropic=True,
                         )
                         anthropic_payload = convert_anthropic_sse_bytes_to_non_stream_json(stream_bytes, anthropic_body)
                         response_json = anthropic_response_to_openai_chat(anthropic_payload, anthropic_body)
@@ -3101,17 +3168,17 @@ async def proxy_chat_completions(
                             total_tokens=total_tokens_text,
                             cached_tokens=cached_tokens_text
                         )
-                        await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group, body_error=body_error)
+                        await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                         await response_context.__aexit__(None, None, None)
                         response_context = None
-                        downstream_payload = rewrite_complete_response_text(response_json, config.response_text_rules, body_error)
+                        downstream_payload = rewrite_complete_response_text(response_json, config.response_text_rules)
                         return JSONResponse(content=downstream_payload, status_code=response.status_code)
 
                     response = await httpx_client.post(anthropic_proxy_url, headers=anthropic_headers, json=anthropic_body)
                     response.raise_for_status()
                     anthropic_payload = response.json()
-                    body_error = observe_buffered_upstream_error(
-                        attempt_entry, response.status_code, anthropic_payload, anthropic=True,
+                    raise_for_buffered_upstream_error(
+                        response.status_code, anthropic_payload, anthropic=True,
                     )
                     attach_attempt_response_body(attempt_entry, anthropic_payload)
 
@@ -3119,7 +3186,7 @@ async def proxy_chat_completions(
                         async def anthropic_fake_stream_generator(final_payload: Dict[str, Any]):
                             for event_bytes in anthropic_response_to_openai_stream_events(
                                     final_payload, anthropic_body,
-                                    transform=lambda payload: rewrite_complete_response_text(payload, config.response_text_rules, body_error),
+                                    transform=lambda payload: rewrite_complete_response_text(payload, config.response_text_rules),
                             ):
                                 yield event_bytes
 
@@ -3138,7 +3205,7 @@ async def proxy_chat_completions(
                             total_tokens=total_tokens if total_tokens is not None else "未知",
                             cached_tokens=cached_tokens if cached_tokens is not None else "未知"
                         )
-                        await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group, body_error=body_error)
+                        await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                         return StreamingResponse(anthropic_fake_stream_generator(anthropic_payload), media_type="text/event-stream")
 
                     response_json = anthropic_response_to_openai_chat(anthropic_payload, anthropic_body)
@@ -3157,8 +3224,8 @@ async def proxy_chat_completions(
                         total_tokens=total_tokens if total_tokens is not None else "未知",
                         cached_tokens=cached_tokens if cached_tokens is not None else "未知"
                     )
-                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group, body_error=body_error)
-                    downstream_payload = rewrite_complete_response_text(response_json, config.response_text_rules, body_error)
+                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
+                    downstream_payload = rewrite_complete_response_text(response_json, config.response_text_rules)
                     return JSONResponse(content=downstream_payload, status_code=response.status_code)
 
                 # 策略强制覆盖 stream，确保上游请求模式与策略一致
@@ -3388,8 +3455,8 @@ async def proxy_chat_completions(
 
                     # 假非流：上游流式，落地后返回非流
                     stream_bytes = await response.aread()
-                    body_error = observe_buffered_upstream_error(
-                        attempt_entry, response.status_code, stream_bytes=stream_bytes,
+                    raise_for_buffered_upstream_error(
+                        response.status_code, stream_bytes=stream_bytes,
                     )
                     merged_json = convert_sse_bytes_to_non_stream_json(stream_bytes)
                     image_public_url_prefix = str(request.base_url).rstrip("/") + GENERATED_IMAGES_ROUTE
@@ -3414,18 +3481,18 @@ async def proxy_chat_completions(
                         total_tokens=total_tokens_text
                     )
 
-                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group, body_error=body_error)
+                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                     await response_context.__aexit__(None, None, None)
                     response_context = None
-                    downstream_payload = rewrite_complete_response_text(merged_json, config.response_text_rules, body_error)
+                    downstream_payload = rewrite_complete_response_text(merged_json, config.response_text_rules)
                     return JSONResponse(content=downstream_payload, status_code=response.status_code)
 
                 # 上游非流
                 response = await httpx_client.post(proxy_url, headers=proxy_headers, json=proxy_body)
                 response.raise_for_status()
                 response_json = response.json()
-                body_error = observe_buffered_upstream_error(
-                    attempt_entry, response.status_code, response_json,
+                raise_for_buffered_upstream_error(
+                    response.status_code, response_json,
                 )
                 image_public_url_prefix = str(request.base_url).rstrip("/") + GENERATED_IMAGES_ROUTE
                 response_json = convert_response_base64_images_to_urls(
@@ -3436,7 +3503,7 @@ async def proxy_chat_completions(
                 )
                 attach_attempt_response_body(attempt_entry, response_json)
                 total_tokens = extract_total_tokens(response_json)
-                downstream_payload = rewrite_complete_response_text(response_json, config.response_text_rules, body_error)
+                downstream_payload = rewrite_complete_response_text(response_json, config.response_text_rules)
 
                 if downstream_is_stream:
                     # 假流式：上游非流，转换为标准 chat.completion.chunk + [DONE]
@@ -3496,7 +3563,7 @@ async def proxy_chat_completions(
                         http_status=response.status_code,
                         total_tokens=total_tokens_text
                     )
-                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group, body_error=body_error)
+                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                     return StreamingResponse(fake_stream_generator(downstream_payload), media_type="text/event-stream")
 
                 total_tokens_text = total_tokens if total_tokens is not None else "未知"
@@ -3511,7 +3578,7 @@ async def proxy_chat_completions(
                     http_status=response.status_code,
                     total_tokens=total_tokens_text
                 )
-                await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group, body_error=body_error)
+                await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                 return JSONResponse(content=downstream_payload, status_code=response.status_code)
 
             except ClientRequestAborted as e:
@@ -3588,22 +3655,27 @@ async def proxy_chat_completions(
                     )
                     continue
                 break
-            except httpx.HTTPStatusError as e:
-                last_error, last_error_response = e, e.response
-                safe_error_text = sanitize_log_text(e.response.text)
-                add_attempt_log_event(
-                    attempt_entry,
-                    "failed",
-                    f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次失败 (HTTP {e.response.status_code}): {safe_error_text}",
-                    status="failed",
-                    status_label="HTTP 失败",
-                    title="上游 HTTP 错误",
-                    finish=True,
-                    http_status=e.response.status_code,
-                    error_type="HTTPStatusError",
-                    error_message=safe_error_text
-                )
-                attach_attempt_response_body(attempt_entry, safe_error_text, safe_error_text)
+            except (httpx.HTTPStatusError, UpstreamBodyError) as e:
+                last_error = e
+                if isinstance(e, UpstreamBodyError):
+                    log_buffered_upstream_error(attempt_entry, e)
+                    last_error_response = httpx.Response(status_code=502, json=e.response_payload)
+                else:
+                    last_error_response = e.response
+                    safe_error_text = sanitize_log_text(e.response.text)
+                    add_attempt_log_event(
+                        attempt_entry,
+                        "failed",
+                        f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次失败 (HTTP {e.response.status_code}): {safe_error_text}",
+                        status="failed",
+                        status_label="HTTP 失败",
+                        title="上游 HTTP 错误",
+                        finish=True,
+                        http_status=e.response.status_code,
+                        error_type="HTTPStatusError",
+                        error_message=safe_error_text
+                    )
+                    attach_attempt_response_body(attempt_entry, safe_error_text, safe_error_text)
                 try:
                     await ensure_client_connected()
                 except ClientRequestAborted as disconnect_error:
@@ -3774,7 +3846,9 @@ async def proxy_chat_completions(
     return JSONResponse(status_code=500, content={"error": f"所有后端均失败。最后错误: {str(last_error)}"})
 
 
-async def proxy_anthropic_messages_native_upstream(request: Request, anthropic_body: Dict[str, Any]) -> Optional[Response]:
+async def proxy_anthropic_messages_native_upstream(
+        request: Request, anthropic_body: Dict[str, Any],
+) -> Response | AnthropicNativeFailure | None:
     """Anthropic 入站 -> Anthropic 原生上游，最小改写 body 以保护 prompt cache 命中。"""
     requested_stream = bool(anthropic_body.get("stream", False))
     requested_model = anthropic_body.get("model")
@@ -3823,6 +3897,8 @@ async def proxy_anthropic_messages_native_upstream(request: Request, anthropic_b
     parent_request_id = f"req-{uuid.uuid4().hex[:12]}"
     last_error = None
     last_error_response = None
+    saw_buffered_body_error = False
+    attempted_config_ids: set[str] = set()
 
     def build_native_body(config: ApiConfig, upstream_is_stream: bool) -> Dict[str, Any]:
         proxy_body = copy.deepcopy(anthropic_body)
@@ -3867,6 +3943,7 @@ async def proxy_anthropic_messages_native_upstream(request: Request, anthropic_b
         return headers
 
     for config in attempt_queue:
+        attempted_config_ids.add(config.id)
         max_retries = config.max_retries if config.max_retries is not None else 0
         if max_retries < 0:
             max_retries = 0
@@ -4051,8 +4128,8 @@ async def proxy_anthropic_messages_native_upstream(request: Request, anthropic_b
                         return StreamingResponse(native_stream_generator(config, response_context_to_pass, response, attempt_entry, proxy_body), media_type="text/event-stream")
 
                     stream_bytes = await response.aread()
-                    body_error = observe_buffered_upstream_error(
-                        attempt_entry, response.status_code, stream_bytes=stream_bytes, anthropic=True,
+                    raise_for_buffered_upstream_error(
+                        response.status_code, stream_bytes=stream_bytes, anthropic=True,
                     )
                     anthropic_payload = convert_anthropic_sse_bytes_to_non_stream_json(stream_bytes, proxy_body)
                     attach_attempt_response_body(attempt_entry, anthropic_payload)
@@ -4070,19 +4147,19 @@ async def proxy_anthropic_messages_native_upstream(request: Request, anthropic_b
                         total_tokens=total_tokens if total_tokens is not None else "未知",
                         cached_tokens=cached_tokens if cached_tokens is not None else "未知"
                     )
-                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group, body_error=body_error)
+                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                     await response_context.__aexit__(None, None, None)
                     response_context = None
                     downstream_payload = rewrite_complete_response_text(
-                        anthropic_payload, config.response_text_rules, body_error, anthropic=True,
+                        anthropic_payload, config.response_text_rules, anthropic=True,
                     )
                     return JSONResponse(status_code=response.status_code, content=downstream_payload)
 
                 response = await httpx_client.post(anthropic_proxy_url, headers=headers, json=proxy_body)
                 response.raise_for_status()
                 anthropic_payload = response.json()
-                body_error = observe_buffered_upstream_error(
-                    attempt_entry, response.status_code, anthropic_payload, anthropic=True,
+                raise_for_buffered_upstream_error(
+                    response.status_code, anthropic_payload, anthropic=True,
                 )
                 attach_attempt_response_body(attempt_entry, anthropic_payload)
                 total_tokens = extract_total_tokens(anthropic_payload)
@@ -4107,9 +4184,9 @@ async def proxy_anthropic_messages_native_upstream(request: Request, anthropic_b
                         total_tokens=total_tokens if total_tokens is not None else "未知",
                         cached_tokens=cached_tokens if cached_tokens is not None else "未知"
                     )
-                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group, body_error=body_error)
+                    await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                     downstream_payload = rewrite_complete_response_text(
-                        openai_payload_for_stream, config.response_text_rules, body_error,
+                        openai_payload_for_stream, config.response_text_rules,
                     )
                     return StreamingResponse(native_fake_stream_generator(downstream_payload, proxy_body), media_type="text/event-stream")
 
@@ -4125,9 +4202,9 @@ async def proxy_anthropic_messages_native_upstream(request: Request, anthropic_b
                     total_tokens=total_tokens if total_tokens is not None else "未知",
                     cached_tokens=cached_tokens if cached_tokens is not None else "未知"
                 )
-                await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group, body_error=body_error)
+                await update_stats_and_state(config, True, scheme_name, original_group, success_index_in_group)
                 downstream_payload = rewrite_complete_response_text(
-                    anthropic_payload, config.response_text_rules, body_error, anthropic=True,
+                    anthropic_payload, config.response_text_rules, anthropic=True,
                 )
                 return JSONResponse(status_code=response.status_code, content=downstream_payload)
 
@@ -4136,12 +4213,18 @@ async def proxy_anthropic_messages_native_upstream(request: Request, anthropic_b
                 last_error_response = JSONResponse(status_code=400, content=anthropic_error(str(e)))
                 add_attempt_log_event(attempt_entry, "failed", f"Anthropic 原生预设错误: {e}", status="failed", status_label="预设失败", title="Anthropic 原生预设错误", finish=True, http_status=400, error_type="EndpointPresetError", error_message=str(e))
                 await update_stats_and_state(config, False, scheme_name, [], 0)
-            except httpx.HTTPStatusError as e:
+            except (httpx.HTTPStatusError, UpstreamBodyError) as e:
                 last_error = e
-                safe_error_text = sanitize_log_text(e.response.text)
-                last_error_response = JSONResponse(status_code=e.response.status_code, content=anthropic_error(safe_error_text))
-                attach_attempt_response_body(attempt_entry, safe_error_text, safe_error_text)
-                add_attempt_log_event(attempt_entry, "failed", f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic 原生请求失败 (HTTP {e.response.status_code}): {safe_error_text}", status="failed", status_label="HTTP 失败", title="Anthropic 原生上游 HTTP 错误", finish=True, http_status=e.response.status_code, error_type="HTTPStatusError", error_message=safe_error_text)
+                if isinstance(e, UpstreamBodyError):
+                    saw_buffered_body_error = True
+                    log_buffered_upstream_error(attempt_entry, e)
+                    error_payload, error_status = openai_error_to_anthropic(e.response_payload, 502)
+                    last_error_response = JSONResponse(status_code=error_status, content=error_payload)
+                else:
+                    safe_error_text = sanitize_log_text(e.response.text)
+                    last_error_response = JSONResponse(status_code=e.response.status_code, content=anthropic_error(safe_error_text))
+                    attach_attempt_response_body(attempt_entry, safe_error_text, safe_error_text)
+                    add_attempt_log_event(attempt_entry, "failed", f"配置项 ID: {config.id} 第 {current_attempt}/{attempt_total} 次 Anthropic 原生请求失败 (HTTP {e.response.status_code}): {safe_error_text}", status="failed", status_label="HTTP 失败", title="Anthropic 原生上游 HTTP 错误", finish=True, http_status=e.response.status_code, error_type="HTTPStatusError", error_message=safe_error_text)
                 await update_stats_and_state(config, False, scheme_name, [], 0)
             except httpx.RequestError as e:
                 last_error = e
@@ -4162,9 +4245,14 @@ async def proxy_anthropic_messages_native_upstream(request: Request, anthropic_b
             break
 
     log_message("所有 Anthropic 原生上游配置项均尝试失败")
-    if last_error_response is not None:
-        return last_error_response
-    return JSONResponse(status_code=500, content=anthropic_error(f"所有 Anthropic 原生上游均失败。最后错误: {str(last_error)}", "api_error"))
+    if last_error_response is None:
+        last_error_response = JSONResponse(
+            status_code=500,
+            content=anthropic_error(f"所有 Anthropic 原生上游均失败。最后错误: {str(last_error)}", "api_error"),
+        )
+    if saw_buffered_body_error:
+        return AnthropicNativeFailure(last_error_response, attempted_config_ids)
+    return last_error_response
 
 
 @app.post("/v1/messages", tags=["Proxy"])
@@ -4180,32 +4268,25 @@ async def proxy_anthropic_messages(
         return JSONResponse(status_code=400, content=anthropic_error("无效的 JSON 请求体"))
 
     native_response = await proxy_anthropic_messages_native_upstream(request, anthropic_body)
-    if native_response is not None:
+    native_failure = native_response if isinstance(native_response, AnthropicNativeFailure) else None
+    if native_response is not None and native_failure is None:
         return native_response
 
     try:
         openai_body = anthropic_to_openai_chat_request(anthropic_body)
     except AnthropicAdapterError as e:
+        if native_failure is not None:
+            return native_failure.response
         log_message(f"Anthropic 请求转换失败: {e}")
         return JSONResponse(status_code=400, content=anthropic_error(str(e)))
 
     requested_stream = bool(anthropic_body.get("stream", False))
 
-    class InternalOpenAIRequest:
-        """最小 Request 适配器，用于复用现有 OpenAI 代理主流程。"""
-        def __init__(self, body: Dict[str, Any], original_request: Request):
-            self._body = body
-            self.headers = original_request.headers
-            self._original_request = original_request
-
-        async def json(self):
-            return self._body
-
-        async def is_disconnected(self):
-            return await self._original_request.is_disconnected()
-
-    internal_request = InternalOpenAIRequest(openai_body, request)
+    internal_request = AnthropicCompatibilityRequest(request, openai_body)
+    internal_request.native_failure = native_failure
     openai_response = await proxy_chat_completions(internal_request, True)
+    if native_failure is not None and openai_response is native_failure.response:
+        return openai_response
 
     if isinstance(openai_response, StreamingResponse):
         if not requested_stream:
