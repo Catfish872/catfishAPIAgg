@@ -1847,8 +1847,67 @@ td .copy-btn {
     min-height: 3rem;
 }
 
+.response-text-rules {
+    display: grid;
+    gap: 0.85rem;
+}
+
+.response-text-rules-header {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 0.75rem 1rem;
+}
+
+.response-text-rules-header > div {
+    flex: 1 1 24rem;
+    min-width: 0;
+}
+
+.response-text-rules-header label,
+.response-text-rules .injected-messages-editor {
+    margin: 0;
+}
+
+.response-text-rules-header small {
+    margin-top: 0.25rem;
+}
+
+.response-text-rules .injected-messages-editor:empty {
+    display: none;
+}
+
 .response-text-rule-row {
-    grid-template-columns: 130px minmax(0, 1fr) auto;
+    --rule-label-height: 1.25rem;
+    --rule-field-gap: 0.4rem;
+    grid-template-columns: minmax(10.75rem, max-content) minmax(0, 1fr) auto;
+    gap: 0.75rem 1rem;
+    padding: 0.875rem 1rem;
+}
+
+.response-text-rule-row .response-text-rule-field {
+    display: grid;
+    gap: var(--rule-field-gap);
+    min-width: 0;
+    margin: 0;
+    line-height: var(--rule-label-height);
+}
+
+.response-text-rule-field > :is(input, select, textarea) {
+    min-width: 0;
+    line-height: 1.25rem;
+}
+
+.response-text-rule-regex {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr));
+    gap: 0.75rem;
+}
+
+.response-text-rule-row [data-remove-rule] {
+    min-height: calc(1.25rem + 1.6rem + 2px);
+    margin-top: calc(var(--rule-label-height) + var(--rule-field-gap));
 }
 
 /* --- 11. 各主题差异强化 --- */
@@ -2180,6 +2239,16 @@ html[data-theme="deepseek"] .ambient-deepseek {
     .model-dropdown-wrap,
     .injected-message-row {
         grid-template-columns: 1fr;
+    }
+
+    .response-text-rule-row {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .response-text-rule-row [data-remove-rule] {
+        justify-self: end;
+        min-height: 0;
+        margin-top: 0;
     }
 
     .stats-collapse-card summary {
